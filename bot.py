@@ -818,11 +818,11 @@ def format_story_caption(article):
     safe_summary = _escape_md(summary)
     safe_source_line = _escape_md(source_line)
 
-    # Assemble caption — no backslashes inside f-string braces
+    # Assemble caption — headline first so it shows in push notifications
     parts = [
-        emoji + " " + _escape_md(cat_name),
-        "",
         "*" + safe_title + "*",
+        "",
+        emoji + " " + _escape_md(cat_name),
         "",
         safe_summary,
         "",
