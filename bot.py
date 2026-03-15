@@ -56,8 +56,8 @@ PORT = int(os.environ.get("PORT", "8080"))
 # IST is UTC+5:30
 IST = timezone(timedelta(hours=5, minutes=30))
 
-HAIKU_MODEL = "claude-3-5-haiku-20241022"
-SONNET_MODEL = "claude-sonnet-4-20250514"
+HAIKU_MODEL = "claude-haiku-4-5-20251001"
+SONNET_MODEL = "claude-sonnet-4-6"
 
 # ─── Logging ─────────────────────────────────────────────────────────────────
 
