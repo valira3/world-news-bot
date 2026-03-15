@@ -807,7 +807,9 @@ def generate_breaking_card(article):
 
     # BREAKING badge
     badge_text = "\u26a0\ufe0f BREAKING NEWS"
-    draw.rounded_rectangle([40, y, 300, y + 40], radius=8, fill=(239, 68, 68))
+    bbox = draw.textbbox((0, 0), badge_text, font=font_breaking)
+    badge_w = bbox[2] - bbox[0] + 30
+    draw.rounded_rectangle([40, y, 40 + badge_w, y + 40], radius=8, fill=(239, 68, 68))
     draw.text((55, y + 7), badge_text, font=font_breaking, fill=(255, 255, 255))
     y += 60
 
