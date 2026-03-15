@@ -656,27 +656,18 @@ async def download_image(session, url, target_size=(280, 160)):
     return None
 
 
-async def fetch_article_images(articles):
-    """Download thumbnail images for articles. Updates articles in-place."""
+async def fetch_og_image_urls(articles):
+    """Fetch og:image URLs for articles. Updates articles in-place with '_og_image_url'."""
     async with aiohttp.ClientSession() as session:
         tasks = []
         for a in articles:
-            img_url = a.get("image_url")
-            article_url = a.get("url", "")
+            async def _fetch(article, page_url):
+                img_url = article.get("image_url")
+                if not img_url and page_url:
+                    img_url = await fetch_og_image(session, page_url)
+                article["_og_image_url"] = img_url
 
-            async def _fetch(article, image_url, page_url):
-                # Try image_url first, then og:image from page
-                img = None
-                if image_url:
-                    img = await download_image(session, image_url)
-                if img is None and page_url:
-                    og_url = await fetch_og_image(session, page_url)
-                    if og_url:
-                        article["image_url"] = og_url
-                        img = await download_image(session, og_url)
-                article["_pil_image"] = img
-
-            tasks.append(_fetch(a, img_url, article_url))
+            tasks.append(_fetch(a, a.get("url", "")))
         await asyncio.gather(*tasks, return_exceptions=True)
 
 
@@ -740,153 +731,6 @@ def truncate_url(url, max_len=50):
     return short
 
 
-def render_story_card(article, scale=2):
-    """Render a clean individual story card image (800x420 at 2x = 1600x840px).
-
-    Layout: dark bg, thumbnail on the left, headline + source + category badge
-    + newsworthiness dots on the right. Returns BytesIO PNG.
-    """
-    old_scale = globals().get("SCALE", 2)
-    sc = scale
-
-    def _s(val):
-        return int(val * sc)
-
-    WIDTH = _s(800)
-    HEIGHT = _s(420)
-    PADDING = _s(30)
-    THUMB_W = _s(260)
-    THUMB_H = _s(220)
-    THUMB_RADIUS = _s(12)
-    BG_COLOR = hex_to_rgb("#1a1a2e")
-    CARD_BG = hex_to_rgb("#16213e")
-    ACCENT_COLOR = hex_to_rgb("#0f3460")
-
-    font_headline = get_font(18, bold=True)
-    font_body = get_font(14)
-    font_small = get_font(12)
-    font_badge = get_font(11, bold=True)
-
-    img = Image.new("RGB", (WIDTH, HEIGHT), BG_COLOR)
-    draw = ImageDraw.Draw(img)
-
-    # Card background with rounded corners
-    draw.rounded_rectangle(
-        [_s(10), _s(10), WIDTH - _s(10), HEIGHT - _s(10)],
-        radius=_s(16),
-        fill=CARD_BG,
-    )
-
-    # --- Left side: thumbnail ---
-    thumb_x = PADDING
-    thumb_y = (HEIGHT - THUMB_H) // 2
-    has_img = article.get("_pil_image") is not None
-
-    if has_img:
-        pil_img = article["_pil_image"]
-        thumb = pil_img.resize((THUMB_W, THUMB_H), Image.LANCZOS)
-        mask = Image.new("L", (THUMB_W, THUMB_H), 0)
-        mask_draw = ImageDraw.Draw(mask)
-        mask_draw.rounded_rectangle([0, 0, THUMB_W, THUMB_H], radius=THUMB_RADIUS, fill=255)
-        img.paste(thumb, (thumb_x, thumb_y), mask)
-    else:
-        # Colored fallback block based on category
-        cat = article.get("category", "general")
-        fallback_color = hex_to_rgb(CATEGORY_COLORS.get(cat, "#6b7280"))
-        # Darken the color slightly for the block
-        dark_color = tuple(max(0, c - 40) for c in fallback_color)
-        draw.rounded_rectangle(
-            [thumb_x, thumb_y, thumb_x + THUMB_W, thumb_y + THUMB_H],
-            radius=THUMB_RADIUS,
-            fill=dark_color,
-        )
-        # Draw category emoji/label centered in fallback
-        cat_label = cat.upper()
-        bbox = draw.textbbox((0, 0), cat_label, font=font_badge)
-        lw = bbox[2] - bbox[0]
-        lh = bbox[3] - bbox[1]
-        draw.text(
-            (thumb_x + (THUMB_W - lw) // 2, thumb_y + (THUMB_H - lh) // 2),
-            cat_label, font=font_badge, fill=(255, 255, 255, 180),
-        )
-
-    # --- Right side: text content ---
-    text_x = thumb_x + THUMB_W + _s(25)
-    text_w = WIDTH - text_x - PADDING
-    cy = PADDING + _s(10)
-
-    # Category badge (colored pill)
-    cat = article.get("category", "general")
-    cat_color = hex_to_rgb(CATEGORY_COLORS.get(cat, "#6b7280"))
-    badge_text = cat.upper()
-    bbox = draw.textbbox((0, 0), badge_text, font=font_badge)
-    bw = bbox[2] - bbox[0] + _s(14)
-    bh = _s(22)
-    draw.rounded_rectangle(
-        [text_x, cy, text_x + bw, cy + bh],
-        radius=_s(11),
-        fill=cat_color,
-    )
-    draw.text((text_x + _s(7), cy + _s(3)), badge_text, font=font_badge, fill=(255, 255, 255))
-
-    # Newsworthiness dots next to badge
-    nw = article.get("newsworthiness", 5)
-    dots_x = text_x + bw + _s(15)
-    for d in range(10):
-        dot_color = (255, 200, 50) if d < int(nw) else (60, 60, 80)
-        dx = dots_x + d * _s(11)
-        draw.ellipse([dx, cy + _s(5), dx + _s(8), cy + _s(13)], fill=dot_color)
-
-    cy += bh + _s(12)
-
-    # Headline (white, bold, 2-3 lines max with ellipsis)
-    title = article.get("title", "Untitled")
-    headline_lines = wrap_text(title, font_headline, text_w, draw)
-    for line in headline_lines[:3]:
-        draw.text((text_x, cy), line, font=font_headline, fill=(255, 255, 255))
-        cy += _s(24)
-    if len(headline_lines) > 3:
-        # Add ellipsis to last visible line
-        last_line = headline_lines[2]
-        if len(last_line) > 3:
-            last_line = last_line[:-3] + "..."
-        # Redraw last line with ellipsis
-        draw.rectangle(
-            [text_x, cy - _s(24), text_x + text_w, cy],
-            fill=CARD_BG,
-        )
-        draw.text((text_x, cy - _s(24)), last_line, font=font_headline, fill=(255, 255, 255))
-    cy += _s(10)
-
-    # Summary (1-2 lines, gray)
-    summary = article.get("ai_summary", article.get("summary", ""))
-    if summary:
-        summary_lines = wrap_text(summary, font_body, text_w, draw)
-        for line in summary_lines[:2]:
-            draw.text((text_x, cy), line, font=font_body, fill=(180, 180, 200))
-            cy += _s(20)
-        cy += _s(8)
-
-    # Source + time ago (gray, smaller)
-    source = article.get("source", "Unknown")
-    time_ago = _format_time_ago(article.get("published", ""))
-    source_line = source
-    if time_ago:
-        source_line = source + "  |  " + time_ago
-    draw.text((text_x, cy), source_line, font=font_small, fill=(120, 120, 150))
-
-    # Bottom accent line
-    draw.line(
-        [(_s(10), HEIGHT - _s(14)), (WIDTH - _s(10), HEIGHT - _s(14))],
-        fill=ACCENT_COLOR,
-        width=_s(2),
-    )
-
-    buf = BytesIO()
-    img.save(buf, format="PNG")
-    buf.seek(0)
-    return buf
-
 
 def _format_time_ago(published_str):
     """Format a published timestamp as a human-readable time-ago string."""
@@ -913,21 +757,18 @@ def _format_time_ago(published_str):
 
 
 def format_story_caption(article):
-    """Build a Telegram caption for a story card photo message.
+    """Build a Telegram caption with all story info (no image text overlay).
 
-    Format: category emoji + name, 1-2 line summary, source + time ago,
-    clickable 'Read full article' link. Kept under 1024 chars.
+    Format: category emoji + name, headline in bold, summary,
+    source + time ago, clickable article link. Kept under 1024 chars.
     Python 3.11 safe — no backslashes inside f-string braces.
     """
     cat = article.get("category", "general")
     emoji = CATEGORY_EMOJI.get(cat, "\U0001f4f0")
     cat_name = cat.capitalize()
 
+    title = article.get("title", "Untitled")
     summary = article.get("ai_summary", article.get("summary", ""))
-    # Truncate summary to ~300 chars to stay under 1024 total
-    if len(summary) > 300:
-        summary = summary[:297] + "..."
-
     source = article.get("source", "Unknown")
     time_ago = _format_time_ago(article.get("published", ""))
     url = article.get("url", "")
@@ -939,12 +780,15 @@ def format_story_caption(article):
     source_line = " \u00b7 ".join(source_parts)
 
     # Escape markdown in dynamic content
+    safe_title = _escape_md(title)
     safe_summary = _escape_md(summary)
     safe_source_line = _escape_md(source_line)
 
     # Assemble caption — no backslashes inside f-string braces
     parts = [
-        emoji + " *" + _escape_md(cat_name) + "*",
+        emoji + " " + _escape_md(cat_name),
+        "",
+        "*" + safe_title + "*",
         "",
         safe_summary,
         "",
@@ -955,12 +799,19 @@ def format_story_caption(article):
 
     # Ensure under 1024 chars (Telegram limit for photo captions)
     if len(caption) > 1024:
-        # Shorten summary further
-        max_summary = 1024 - (len(caption) - len(safe_summary)) - 20
-        if max_summary > 0:
+        # Calculate how much space summary can take
+        without_summary = "\n".join(parts[:4] + ["", ""] + parts[6:])
+        max_summary = 1024 - len(without_summary) - 10
+        if max_summary > 20:
             safe_summary = safe_summary[:max_summary] + "..."
-        parts[2] = safe_summary
+        else:
+            safe_summary = ""
+        parts[4] = safe_summary
         caption = "\n".join(parts)
+
+    # Final safety truncation
+    if len(caption) > 1024:
+        caption = caption[:1021] + "..."
 
     return caption
 
@@ -1045,6 +896,50 @@ async def cmd_news(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def _send_story(bot, chat_id, article):
+    """Send a single story: photo with caption if og:image available, else text only."""
+    caption = format_story_caption(article)
+    image_url = article.get("_og_image_url")
+    if image_url:
+        try:
+            # Try passing URL directly — Telegram can fetch it
+            await bot.send_photo(
+                chat_id=chat_id,
+                photo=image_url,
+                caption=caption,
+                parse_mode="Markdown",
+            )
+            return
+        except Exception:
+            # Fall back to downloading bytes
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(
+                        image_url,
+                        timeout=aiohttp.ClientTimeout(total=10),
+                        headers={"User-Agent": "Mozilla/5.0"},
+                    ) as resp:
+                        if resp.status == 200 and "image" in resp.content_type:
+                            data = await resp.read()
+                            if len(data) >= 500:
+                                await bot.send_photo(
+                                    chat_id=chat_id,
+                                    photo=data,
+                                    caption=caption,
+                                    parse_mode="Markdown",
+                                )
+                                return
+            except Exception:
+                pass
+    # No image or image failed — send text only
+    await bot.send_message(
+        chat_id=chat_id,
+        text=caption,
+        parse_mode="Markdown",
+        disable_web_page_preview=True,
+    )
+
+
 async def cmd_briefing(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Visual briefing: individual story cards sent as separate messages."""
     await update.message.reply_text("\U0001f3a8 Generating visual briefing...")
@@ -1071,8 +966,8 @@ async def cmd_briefing(update: Update, context: ContextTypes.DEFAULT_TYPE):
     articles.sort(key=lambda x: x.get("_score", 0), reverse=True)
     top = articles[:7]
 
-    # Fetch article images
-    await fetch_article_images(top)
+    # Fetch og:image URLs for articles
+    await fetch_og_image_urls(top)
 
     # Header message
     now_ist = datetime.now(IST)
@@ -1084,20 +979,13 @@ async def cmd_briefing(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text(header, parse_mode=ParseMode.MARKDOWN)
 
-    # Send each story as an individual photo + caption
+    # Send each story as photo + caption (or text-only fallback)
     chat_id = update.effective_chat.id
     for a in top:
         try:
-            img_buf = render_story_card(a, scale=2)
-            caption = format_story_caption(a)
-            await context.bot.send_photo(
-                chat_id=chat_id,
-                photo=img_buf,
-                caption=caption,
-                parse_mode="Markdown",
-            )
+            await _send_story(context.bot, chat_id, a)
         except Exception as e:
-            logger.warning("Failed to send story card: %s", e)
+            logger.warning("Failed to send story: %s", e)
         await asyncio.sleep(0.3)
 
     # Footer message
@@ -1105,10 +993,6 @@ async def cmd_briefing(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "\U0001f50e Use /topic <keyword> to dive deeper into any story",
         parse_mode=ParseMode.MARKDOWN,
     )
-
-    # Cleanup pil images from memory
-    for a in top:
-        a.pop("_pil_image", None)
 
 
 async def cmd_breaking(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1144,24 +1028,16 @@ async def cmd_breaking(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode=ParseMode.MARKDOWN,
     )
 
-    # Fetch article images
-    await fetch_article_images(top_breaking)
+    # Fetch og:image URLs for articles
+    await fetch_og_image_urls(top_breaking)
 
-    # Send each breaking story as individual photo + caption
+    # Send each breaking story as photo + caption (or text-only fallback)
     chat_id = update.effective_chat.id
     for a in top_breaking:
         try:
-            img_buf = render_story_card(a, scale=2)
-            caption = format_story_caption(a)
-            await context.bot.send_photo(
-                chat_id=chat_id,
-                photo=img_buf,
-                caption=caption,
-                parse_mode="Markdown",
-            )
+            await _send_story(context.bot, chat_id, a)
         except Exception as e:
-            logger.warning("Failed to send breaking card: %s", e)
-        a.pop("_pil_image", None)
+            logger.warning("Failed to send breaking story: %s", e)
         await asyncio.sleep(0.3)
 
 
@@ -1590,7 +1466,7 @@ async def scheduled_fetch(app):
 
 
 async def scheduled_briefing(app):
-    """Send scheduled briefings as individual story cards."""
+    """Send scheduled briefings as photo + caption messages."""
     try:
         articles = load_news_cache()
         if not articles:
@@ -1615,18 +1491,8 @@ async def scheduled_briefing(app):
         current_time = now_ist.strftime("%H:%M")
         date_str = now_ist.strftime("%B %d, %Y")
 
-        # Fetch article images once for all users
-        await fetch_article_images(top)
-
-        # Pre-render all story cards once
-        rendered_cards = []
-        for a in top:
-            try:
-                img_buf = render_story_card(a, scale=2)
-                caption = format_story_caption(a)
-                rendered_cards.append((img_buf, caption))
-            except Exception as e:
-                logger.warning("Failed to render story card: %s", e)
+        # Fetch og:image URLs once for all users
+        await fetch_og_image_urls(top)
 
         source_count = len(set(a.get("source", "") for a in top))
 
@@ -1655,15 +1521,12 @@ async def scheduled_briefing(app):
                     parse_mode=ParseMode.MARKDOWN,
                 )
 
-                # Send each story card
-                for img_buf, caption in rendered_cards:
-                    img_buf.seek(0)
-                    await app.bot.send_photo(
-                        chat_id=chat_id,
-                        photo=img_buf,
-                        caption=caption,
-                        parse_mode="Markdown",
-                    )
+                # Send each story
+                for a in top:
+                    try:
+                        await _send_story(app.bot, chat_id, a)
+                    except Exception as e:
+                        logger.warning("Failed to send story to %s: %s", uid, e)
                     await asyncio.sleep(0.3)
 
                 # Footer
@@ -1674,10 +1537,6 @@ async def scheduled_briefing(app):
                 )
             except Exception as e:
                 logger.warning("Failed to send briefing to %s: %s", uid, e)
-
-        # Cleanup pil images
-        for a in top:
-            a.pop("_pil_image", None)
     except Exception as e:
         logger.error("Scheduled briefing error: %s", e)
 
