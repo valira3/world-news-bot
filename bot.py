@@ -80,6 +80,11 @@ RSS_FEEDS = {
     "France24": "https://www.france24.com/en/rss",
     "DW News": "https://rss.dw.com/rdf/rss-en-world",
     "ABC News": "https://abcnews.go.com/abcnews/internationalheadlines",
+    # Chicago local news
+    "Chicago Sun-Times": "https://chicago.suntimes.com/rss/index.xml",
+    "Block Club Chicago": "https://blockclubchicago.org/feed/",
+    "WTTW Chicago": "https://news.wttw.com/rss.xml",
+    "Chicago Reader": "https://chicagoreader.com/feed/",
 }
 
 # ─── Categories ──────────────────────────────────────────────────────────────
@@ -92,6 +97,7 @@ CATEGORIES = {
     "conflict": ["military", "attack", "missile", "troops", "invasion", "ceasefire"],
     "science": ["study", "research", "space", "nasa", "discovery", "medical", "vaccine"],
     "markets": ["stock", "nasdaq", "dow", "crypto", "bitcoin", "oil", "gold"],
+    "local": ["chicago", "illinois", "cook county", "mayor", "cta", "cubs", "bears", "bulls", "white sox", "blackhawks", "o'hare", "midway", "loop", "south side", "north side", "wrigley"],
 }
 
 CATEGORY_COLORS = {
@@ -102,6 +108,7 @@ CATEGORY_COLORS = {
     "conflict": "#ef4444",
     "science": "#f59e0b",
     "markets": "#ec4899",
+    "local": "#f97316",
     "general": "#6b7280",
 }
 
@@ -113,6 +120,7 @@ CATEGORY_EMOJI = {
     "conflict": "\u2694\ufe0f",
     "science": "\U0001f52c",
     "markets": "\U0001f4c8",
+    "local": "\U0001f3d9\ufe0f",
     "general": "\U0001f4f0",
 }
 
@@ -127,6 +135,7 @@ USER_PREFS_FILE = "user_prefs.json"
 SENT_ARTICLES_FILE = "sent_articles.json"
 CONVERSATION_FILE = "conversation_history.json"
 BOT_STATE_FILE = "bot_state.json"
+ALERTS_SENT_FILE = "alerts_sent.json"
 
 # ─── Data Helpers ────────────────────────────────────────────────────────────
 
@@ -282,6 +291,31 @@ def mark_sent(article_id):
 def is_sent(article_id):
     sent = load_json(SENT_ARTICLES_FILE, {})
     return article_id in sent
+
+
+def mark_alert_sent(article_id):
+    """Mark an article as sent via breaking news auto-alert."""
+    alerts = load_json(ALERTS_SENT_FILE, {})
+    alerts[article_id] = datetime.now(timezone.utc).isoformat()
+    # Trim to 7 days
+    cutoff = datetime.now(timezone.utc) - timedelta(days=7)
+    trimmed = {}
+    for aid, ts in alerts.items():
+        try:
+            dt = datetime.fromisoformat(ts)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            if dt > cutoff:
+                trimmed[aid] = ts
+        except (ValueError, TypeError):
+            trimmed[aid] = ts
+    save_json(ALERTS_SENT_FILE, trimmed)
+
+
+def is_alert_sent(article_id):
+    """Check if an article has already been sent as a breaking alert."""
+    alerts = load_json(ALERTS_SENT_FILE, {})
+    return article_id in alerts
 
 
 # ─── Claude API ──────────────────────────────────────────────────────────────
@@ -1378,6 +1412,7 @@ async def cmd_set(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "\u2699\ufe0f *Settings*\n\n"
             "/set summary short|medium|long\n"
             "/set schedule HH:MM\n"
+            "/set alerts on|off\n"
             "\nCurrent preferences:\n"
             + _format_prefs(get_user_prefs(update.effective_user.id)),
             parse_mode=ParseMode.MARKDOWN,
@@ -1385,7 +1420,7 @@ async def cmd_set(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     param = context.args[0].lower()
-    value = context.args[1]
+    value = context.args[1].lower()
 
     if param == "summary":
         if value not in ("short", "medium", "long"):
@@ -1399,6 +1434,13 @@ async def cmd_set(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         set_user_prefs(update.effective_user.id, "schedule", value)
         await update.message.reply_text("\u2705 Schedule set to: " + value + " IST")
+    elif param == "alerts":
+        if value not in ("on", "off"):
+            await update.message.reply_text("Options: on, off")
+            return
+        set_user_prefs(update.effective_user.id, "alerts", value == "on")
+        status = "enabled" if value == "on" else "disabled"
+        await update.message.reply_text("\u2705 Breaking news alerts " + status)
     else:
         await update.message.reply_text("Unknown setting: " + param)
 
@@ -1427,7 +1469,11 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/sentiment  \u2014 News mood gauge\n"
         "/set        \u2014 Adjust preferences\n"
         "\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
-        "Powered by Claude AI + 10 sources"
+        "\U0001f514 *Auto-Alerts:* Breaking news (8+)\n"
+        "is auto-sent every 30 min.\n"
+        "Toggle: /set alerts on|off\n"
+        "\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
+        "Powered by Claude AI + 14 sources"
     )
     await update.message.reply_text(help_text, parse_mode=ParseMode.MARKDOWN)
 
@@ -1447,20 +1493,51 @@ def _escape_md(text):
 def _format_prefs(prefs):
     cats = prefs.get("categories", [])
     cat_str = ", ".join(cats) if cats else "all"
+    alerts_status = "on" if prefs.get("alerts", True) else "off"
     return (
         "Categories: " + cat_str + "\n"
         "Schedule: " + prefs.get("schedule", "07:00") + " IST\n"
-        "Summary: " + prefs.get("summary_length", "medium")
+        "Summary: " + prefs.get("summary_length", "medium") + "\n"
+        "Alerts: " + alerts_status
     )
 
 
 # ─── Scheduled Tasks ────────────────────────────────────────────────────────
 
 async def scheduled_fetch(app):
-    """Periodic news fetch."""
+    """Periodic news fetch + auto-send breaking alerts."""
     try:
         count = await fetch_all_news()
         logger.info("Scheduled fetch completed: %d new articles", count)
+
+        # Auto-send breaking news alerts (newsworthiness >= 8)
+        articles = load_news_cache()
+        new_breaking = []
+        for a in articles:
+            aid = a.get("id", "")
+            if aid and a.get("newsworthiness", 0) >= 8 and not is_alert_sent(aid):
+                new_breaking.append(a)
+                mark_alert_sent(aid)
+            if len(new_breaking) >= 5:
+                break
+
+        if new_breaking:
+            logger.info("Auto-alerting %d breaking stories", len(new_breaking))
+            await fetch_og_image_urls(new_breaking)
+            prefs = load_json(USER_PREFS_FILE, {})
+            for uid, user_prefs in prefs.items():
+                if not user_prefs.get("alerts", True):
+                    continue
+                try:
+                    chat_id = int(uid)
+                    for a in new_breaking:
+                        try:
+                            await _send_story(app.bot, chat_id, a)
+                        except Exception as e:
+                            logger.warning("Alert send failed for %s: %s", uid, e)
+                        await asyncio.sleep(0.3)
+                except Exception as e:
+                    logger.warning("Alert failed for user %s: %s", uid, e)
     except Exception as e:
         logger.error("Scheduled fetch error: %s", e)
 
