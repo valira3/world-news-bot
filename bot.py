@@ -740,283 +740,229 @@ def truncate_url(url, max_len=50):
     return short
 
 
-def generate_briefing_image(articles, title_text="WORLD NEWS BRIEFING"):
-    """Generate a high-res dark-themed briefing infographic with inline images."""
-    WIDTH = s(900)
-    PADDING = s(40)
-    CARD_PADDING = s(20)
-    THUMB_W = s(140)
-    THUMB_H = s(90)
-    THUMB_RADIUS = s(8)
+def render_story_card(article, scale=2):
+    """Render a clean individual story card image (800x420 at 2x = 1600x840px).
+
+    Layout: dark bg, thumbnail on the left, headline + source + category badge
+    + newsworthiness dots on the right. Returns BytesIO PNG.
+    """
+    old_scale = globals().get("SCALE", 2)
+    sc = scale
+
+    def _s(val):
+        return int(val * sc)
+
+    WIDTH = _s(800)
+    HEIGHT = _s(420)
+    PADDING = _s(30)
+    THUMB_W = _s(260)
+    THUMB_H = _s(220)
+    THUMB_RADIUS = _s(12)
     BG_COLOR = hex_to_rgb("#1a1a2e")
     CARD_BG = hex_to_rgb("#16213e")
+    ACCENT_COLOR = hex_to_rgb("#0f3460")
 
-    font_title = get_font(32, bold=True)
-    font_headline = get_font(20, bold=True)
-    font_body = get_font(16)
-    font_small = get_font(14)
-    font_badge = get_font(13, bold=True)
-    font_link = get_font(12)
+    font_headline = get_font(18, bold=True)
+    font_body = get_font(14)
+    font_small = get_font(12)
+    font_badge = get_font(11, bold=True)
 
-    # Temp image for text measurement
-    tmp_img = Image.new("RGB", (WIDTH, 100))
-    tmp_draw = ImageDraw.Draw(tmp_img)
-
-    y = PADDING
-    y += s(50)   # Title
-    y += s(30)   # Subtitle
-    y += s(30)   # Separator
-
-    # Pre-calculate card heights
-    card_heights = []
-    for article in articles[:10]:
-        has_img = article.get("_pil_image") is not None
-        h = CARD_PADDING * 2
-        h += s(30)  # badge row
-        # Text area width is narrower if thumbnail exists
-        text_w = WIDTH - PADDING * 2 - CARD_PADDING * 2 - s(20)
-        if has_img:
-            text_w -= THUMB_W + s(15)
-        headline_lines = wrap_text(article.get("title", ""), font_headline, text_w, tmp_draw)
-        h_text = len(headline_lines) * s(26)
-        h_text += s(10)
-        summary = article.get("ai_summary", article.get("summary", ""))
-        if summary:
-            summary_lines = wrap_text(summary, font_body, text_w, tmp_draw)
-            h_text += min(len(summary_lines), 4) * s(22)
-        h_text += s(10)
-        h_text += s(20)  # source line
-        h_text += s(18)  # link line
-        # If thumbnail, ensure card is at least tall enough for image
-        content_h = h_text
-        if has_img:
-            content_h = max(content_h, THUMB_H + s(10))
-        h += content_h
-        card_heights.append(h)
-        y += h + s(15)
-
-    y += s(50)  # footer
-    HEIGHT = max(y + PADDING, s(400))
-
-    # Create final image
     img = Image.new("RGB", (WIDTH, HEIGHT), BG_COLOR)
     draw = ImageDraw.Draw(img)
 
-    y = PADDING
+    # Card background with rounded corners
+    draw.rounded_rectangle(
+        [_s(10), _s(10), WIDTH - _s(10), HEIGHT - _s(10)],
+        radius=_s(16),
+        fill=CARD_BG,
+    )
 
-    # Header
-    now_ist = datetime.now(IST)
-    date_str = now_ist.strftime("%B %d, %Y  |  %I:%M %p IST")
-    draw.text((PADDING, y), title_text, font=font_title, fill=(255, 255, 255))
-    y += s(45)
-    draw.text((PADDING, y), date_str, font=font_small, fill=(150, 150, 170))
-    y += s(25)
-
-    # Separator line
-    draw.line([(PADDING, y), (WIDTH - PADDING, y)], fill=hex_to_rgb("#0f3460"), width=s(2))
-    y += s(20)
-
-    # Article cards
-    for i, article in enumerate(articles[:10]):
-        card_h = card_heights[i] if i < len(card_heights) else s(150)
-        card_x = PADDING
-        card_y = y
-        card_w = WIDTH - PADDING * 2
-        has_img = article.get("_pil_image") is not None
-
-        # Card background
-        draw.rounded_rectangle(
-            [card_x, card_y, card_x + card_w, card_y + card_h],
-            radius=s(12),
-            fill=CARD_BG,
-        )
-
-        cx = card_x + CARD_PADDING
-        cy = card_y + CARD_PADDING
-
-        # Category badge
-        cat = article.get("category", "general")
-        cat_color = hex_to_rgb(CATEGORY_COLORS.get(cat, "#6b7280"))
-        badge_text = cat.upper()
-        bbox = draw.textbbox((0, 0), badge_text, font=font_badge)
-        bw = bbox[2] - bbox[0] + s(16)
-        draw.rounded_rectangle(
-            [cx, cy, cx + bw, cy + s(24)],
-            radius=s(12),
-            fill=cat_color,
-        )
-        draw.text((cx + s(8), cy + s(3)), badge_text, font=font_badge, fill=(255, 255, 255))
-
-        # Newsworthiness dots
-        nw = article.get("newsworthiness", 5)
-        dots_x = card_x + card_w - CARD_PADDING - s(120)
-        for d in range(10):
-            dot_color = (255, 200, 50) if d < int(nw) else (60, 60, 80)
-            dx = dots_x + d * s(12)
-            draw.ellipse([dx, cy + s(5), dx + s(9), cy + s(14)], fill=dot_color)
-
-        cy += s(30)
-
-        # Paste thumbnail on the right side of the card
-        thumb_x = card_x + card_w - CARD_PADDING - THUMB_W
-        thumb_y = cy
-        if has_img:
-            pil_img = article["_pil_image"]
-            # Resize to scaled thumbnail size
-            thumb = pil_img.resize((THUMB_W, THUMB_H), Image.LANCZOS)
-            # Create rounded mask
-            mask = Image.new("L", (THUMB_W, THUMB_H), 0)
-            mask_draw = ImageDraw.Draw(mask)
-            mask_draw.rounded_rectangle([0, 0, THUMB_W, THUMB_H], radius=THUMB_RADIUS, fill=255)
-            img.paste(thumb, (thumb_x, thumb_y), mask)
-
-        # Text area (narrower if image present)
-        text_x = cx + s(5)
-        text_w = card_w - CARD_PADDING * 2 - s(20)
-        if has_img:
-            text_w -= THUMB_W + s(15)
-
-        # Headline
-        headline_lines = wrap_text(article.get("title", ""), font_headline, text_w, draw)
-        for line in headline_lines:
-            draw.text((text_x, cy), line, font=font_headline, fill=(255, 255, 255))
-            cy += s(26)
-        cy += s(8)
-
-        # Summary
-        summary = article.get("ai_summary", article.get("summary", ""))
-        if summary:
-            summary_lines = wrap_text(summary, font_body, text_w, draw)
-            for line in summary_lines[:4]:
-                draw.text((text_x, cy), line, font=font_body, fill=(180, 180, 200))
-                cy += s(22)
-        cy += s(8)
-
-        # Source + time
-        pub = article.get("published", "")
-        try:
-            pub_dt = datetime.fromisoformat(pub.replace("Z", "+00:00"))
-            time_str = pub_dt.strftime("%I:%M %p")
-        except (ValueError, AttributeError):
-            time_str = ""
-        source_text = article.get("source", "") + ("  |  " + time_str if time_str else "")
-        draw.text((text_x, cy), source_text, font=font_small, fill=(120, 120, 140))
-        cy += s(18)
-
-        # Article link
-        link_text = truncate_url(article.get("url", ""))
-        draw.text((text_x, cy), link_text, font=font_link, fill=(100, 140, 200))
-
-        y += card_h + s(15)
-
-    # Footer
-    y += s(10)
-    draw.line([(PADDING, y), (WIDTH - PADDING, y)], fill=hex_to_rgb("#0f3460"), width=1)
-    y += s(15)
-    source_count = len(set(a.get("source", "") for a in articles))
-    footer = "Powered by World News Bot  |  " + str(source_count) + " sources  |  " + str(len(articles)) + " stories"
-    draw.text((PADDING, y), footer, font=font_small, fill=(100, 100, 120))
-
-    buf = BytesIO()
-    img.save(buf, format="PNG")
-    buf.seek(0)
-    return buf
-
-
-def generate_breaking_card(article):
-    """Generate a high-res breaking news card with inline image."""
-    WIDTH = s(900)
-    BG_COLOR = hex_to_rgb("#1a1a2e")
-    THUMB_W = s(320)
-    THUMB_H = s(180)
-
-    font_breaking = get_font(28, bold=True)
-    font_headline = get_font(24, bold=True)
-    font_body = get_font(18)
-    font_small = get_font(14)
-    font_link = get_font(12)
-
+    # --- Left side: thumbnail ---
+    thumb_x = PADDING
+    thumb_y = (HEIGHT - THUMB_H) // 2
     has_img = article.get("_pil_image") is not None
 
-    # Pre-calc dynamic height
-    tmp_img = Image.new("RGB", (WIDTH, 100))
-    tmp_draw = ImageDraw.Draw(tmp_img)
-    y_calc = s(30) + s(50)  # top margin + badge
-    headline_lines = wrap_text(article.get("title", ""), font_headline, WIDTH - s(100), tmp_draw)
-    y_calc += min(len(headline_lines), 3) * s(34) + s(15)
-    summary = article.get("ai_summary", article.get("summary", ""))
-    if summary:
-        summary_lines = wrap_text(summary, font_body, WIDTH - s(100), tmp_draw)
-        y_calc += min(len(summary_lines), 5) * s(28)
-    y_calc += s(20)
-    if has_img:
-        y_calc += THUMB_H + s(20)
-    y_calc += s(80)  # takeaway + source + link + padding
-    HEIGHT = max(y_calc, s(400))
-
-    img = Image.new("RGB", (WIDTH, HEIGHT), BG_COLOR)
-    draw = ImageDraw.Draw(img)
-
-    # Red accent stripe
-    draw.rectangle([0, 0, WIDTH, s(8)], fill=(239, 68, 68))
-
-    y = s(30)
-
-    # BREAKING badge
-    badge_text = "BREAKING NEWS"
-    bbox = draw.textbbox((0, 0), badge_text, font=font_breaking)
-    badge_w = bbox[2] - bbox[0] + s(30)
-    draw.rounded_rectangle([s(40), y, s(40) + badge_w, y + s(44)], radius=s(8), fill=(239, 68, 68))
-    draw.text((s(55), y + s(8)), badge_text, font=font_breaking, fill=(255, 255, 255))
-    y += s(60)
-
-    # Headline
-    headline_lines = wrap_text(article.get("title", ""), font_headline, WIDTH - s(100), draw)
-    for line in headline_lines[:3]:
-        draw.text((s(40), y), line, font=font_headline, fill=(255, 255, 255))
-        y += s(34)
-    y += s(15)
-
-    # Inline article image
     if has_img:
         pil_img = article["_pil_image"]
         thumb = pil_img.resize((THUMB_W, THUMB_H), Image.LANCZOS)
         mask = Image.new("L", (THUMB_W, THUMB_H), 0)
         mask_draw = ImageDraw.Draw(mask)
-        mask_draw.rounded_rectangle([0, 0, THUMB_W, THUMB_H], radius=s(10), fill=255)
-        img.paste(thumb, (s(40), y), mask)
-        y += THUMB_H + s(15)
+        mask_draw.rounded_rectangle([0, 0, THUMB_W, THUMB_H], radius=THUMB_RADIUS, fill=255)
+        img.paste(thumb, (thumb_x, thumb_y), mask)
+    else:
+        # Colored fallback block based on category
+        cat = article.get("category", "general")
+        fallback_color = hex_to_rgb(CATEGORY_COLORS.get(cat, "#6b7280"))
+        # Darken the color slightly for the block
+        dark_color = tuple(max(0, c - 40) for c in fallback_color)
+        draw.rounded_rectangle(
+            [thumb_x, thumb_y, thumb_x + THUMB_W, thumb_y + THUMB_H],
+            radius=THUMB_RADIUS,
+            fill=dark_color,
+        )
+        # Draw category emoji/label centered in fallback
+        cat_label = cat.upper()
+        bbox = draw.textbbox((0, 0), cat_label, font=font_badge)
+        lw = bbox[2] - bbox[0]
+        lh = bbox[3] - bbox[1]
+        draw.text(
+            (thumb_x + (THUMB_W - lw) // 2, thumb_y + (THUMB_H - lh) // 2),
+            cat_label, font=font_badge, fill=(255, 255, 255, 180),
+        )
 
-    # Summary
+    # --- Right side: text content ---
+    text_x = thumb_x + THUMB_W + _s(25)
+    text_w = WIDTH - text_x - PADDING
+    cy = PADDING + _s(10)
+
+    # Category badge (colored pill)
+    cat = article.get("category", "general")
+    cat_color = hex_to_rgb(CATEGORY_COLORS.get(cat, "#6b7280"))
+    badge_text = cat.upper()
+    bbox = draw.textbbox((0, 0), badge_text, font=font_badge)
+    bw = bbox[2] - bbox[0] + _s(14)
+    bh = _s(22)
+    draw.rounded_rectangle(
+        [text_x, cy, text_x + bw, cy + bh],
+        radius=_s(11),
+        fill=cat_color,
+    )
+    draw.text((text_x + _s(7), cy + _s(3)), badge_text, font=font_badge, fill=(255, 255, 255))
+
+    # Newsworthiness dots next to badge
+    nw = article.get("newsworthiness", 5)
+    dots_x = text_x + bw + _s(15)
+    for d in range(10):
+        dot_color = (255, 200, 50) if d < int(nw) else (60, 60, 80)
+        dx = dots_x + d * _s(11)
+        draw.ellipse([dx, cy + _s(5), dx + _s(8), cy + _s(13)], fill=dot_color)
+
+    cy += bh + _s(12)
+
+    # Headline (white, bold, 2-3 lines max with ellipsis)
+    title = article.get("title", "Untitled")
+    headline_lines = wrap_text(title, font_headline, text_w, draw)
+    for line in headline_lines[:3]:
+        draw.text((text_x, cy), line, font=font_headline, fill=(255, 255, 255))
+        cy += _s(24)
+    if len(headline_lines) > 3:
+        # Add ellipsis to last visible line
+        last_line = headline_lines[2]
+        if len(last_line) > 3:
+            last_line = last_line[:-3] + "..."
+        # Redraw last line with ellipsis
+        draw.rectangle(
+            [text_x, cy - _s(24), text_x + text_w, cy],
+            fill=CARD_BG,
+        )
+        draw.text((text_x, cy - _s(24)), last_line, font=font_headline, fill=(255, 255, 255))
+    cy += _s(10)
+
+    # Summary (1-2 lines, gray)
+    summary = article.get("ai_summary", article.get("summary", ""))
     if summary:
-        summary_lines = wrap_text(summary, font_body, WIDTH - s(100), draw)
-        for line in summary_lines[:5]:
-            draw.text((s(40), y), line, font=font_body, fill=(180, 180, 200))
-            y += s(28)
-    y += s(15)
+        summary_lines = wrap_text(summary, font_body, text_w, draw)
+        for line in summary_lines[:2]:
+            draw.text((text_x, cy), line, font=font_body, fill=(180, 180, 200))
+            cy += _s(20)
+        cy += _s(8)
 
-    # Takeaway
-    takeaway = article.get("ai_takeaway", "")
-    if takeaway:
-        ta_lines = wrap_text("So what? " + takeaway, font_small, WIDTH - s(100), draw)
-        for line in ta_lines[:2]:
-            draw.text((s(40), y), line, font=font_small, fill=(255, 200, 50))
-            y += s(20)
-    y += s(10)
+    # Source + time ago (gray, smaller)
+    source = article.get("source", "Unknown")
+    time_ago = _format_time_ago(article.get("published", ""))
+    source_line = source
+    if time_ago:
+        source_line = source + "  |  " + time_ago
+    draw.text((text_x, cy), source_line, font=font_small, fill=(120, 120, 150))
 
-    # Source
-    source_text = article.get("source", "") + "  |  Newsworthiness: " + str(article.get("newsworthiness", "N/A")) + "/10"
-    draw.text((s(40), y), source_text, font=font_small, fill=(120, 120, 140))
-    y += s(20)
-
-    # Article link
-    link_text = truncate_url(article.get("url", ""), 70)
-    draw.text((s(40), y), link_text, font=font_link, fill=(100, 140, 200))
+    # Bottom accent line
+    draw.line(
+        [(_s(10), HEIGHT - _s(14)), (WIDTH - _s(10), HEIGHT - _s(14))],
+        fill=ACCENT_COLOR,
+        width=_s(2),
+    )
 
     buf = BytesIO()
     img.save(buf, format="PNG")
     buf.seek(0)
     return buf
+
+
+def _format_time_ago(published_str):
+    """Format a published timestamp as a human-readable time-ago string."""
+    if not published_str:
+        return ""
+    try:
+        pub = datetime.fromisoformat(published_str.replace("Z", "+00:00"))
+        if pub.tzinfo is None:
+            pub = pub.replace(tzinfo=timezone.utc)
+        now = datetime.now(timezone.utc)
+        diff = now - pub
+        minutes = int(diff.total_seconds() / 60)
+        if minutes < 1:
+            return "just now"
+        if minutes < 60:
+            return str(minutes) + "m ago"
+        hours = minutes // 60
+        if hours < 24:
+            return str(hours) + "h ago"
+        days = hours // 24
+        return str(days) + "d ago"
+    except (ValueError, TypeError, AttributeError):
+        return ""
+
+
+def format_story_caption(article):
+    """Build a Telegram caption for a story card photo message.
+
+    Format: category emoji + name, 1-2 line summary, source + time ago,
+    clickable 'Read full article' link. Kept under 1024 chars.
+    Python 3.11 safe — no backslashes inside f-string braces.
+    """
+    cat = article.get("category", "general")
+    emoji = CATEGORY_EMOJI.get(cat, "\U0001f4f0")
+    cat_name = cat.capitalize()
+
+    summary = article.get("ai_summary", article.get("summary", ""))
+    # Truncate summary to ~300 chars to stay under 1024 total
+    if len(summary) > 300:
+        summary = summary[:297] + "..."
+
+    source = article.get("source", "Unknown")
+    time_ago = _format_time_ago(article.get("published", ""))
+    url = article.get("url", "")
+
+    # Build source line
+    source_parts = [source]
+    if time_ago:
+        source_parts.append(time_ago)
+    source_line = " \u00b7 ".join(source_parts)
+
+    # Escape markdown in dynamic content
+    safe_summary = _escape_md(summary)
+    safe_source_line = _escape_md(source_line)
+
+    # Assemble caption — no backslashes inside f-string braces
+    parts = [
+        emoji + " *" + _escape_md(cat_name) + "*",
+        "",
+        safe_summary,
+        "",
+        "\U0001f4e1 " + safe_source_line,
+        "\U0001f517 [Read full article](" + url + ")",
+    ]
+    caption = "\n".join(parts)
+
+    # Ensure under 1024 chars (Telegram limit for photo captions)
+    if len(caption) > 1024:
+        # Shorten summary further
+        max_summary = 1024 - (len(caption) - len(safe_summary)) - 20
+        if max_summary > 0:
+            safe_summary = safe_summary[:max_summary] + "..."
+        parts[2] = safe_summary
+        caption = "\n".join(parts)
+
+    return caption
 
 
 # ─── Telegram Command Handlers ──────────────────────────────────────────────
@@ -1100,7 +1046,7 @@ async def cmd_news(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_briefing(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Full visual briefing report."""
+    """Visual briefing: individual story cards sent as separate messages."""
     await update.message.reply_text("\U0001f3a8 Generating visual briefing...")
     articles = load_news_cache()
     if not articles:
@@ -1123,35 +1069,41 @@ async def cmd_briefing(update: Update, context: ContextTypes.DEFAULT_TYPE):
         a["_score"] = a.get("newsworthiness", 5) - (hours_old * 0.1)
 
     articles.sort(key=lambda x: x.get("_score", 0), reverse=True)
-    top = articles[:8]
+    top = articles[:7]
 
-    # Fetch article images for the infographic
+    # Fetch article images
     await fetch_article_images(top)
 
-    # Generate image
-    img_buf = generate_briefing_image(top)
-    await update.message.reply_photo(
-        photo=img_buf,
-        caption="\U0001f30d *World News Briefing*\n" + str(len(top)) + " top stories from " + str(len(set(a.get("source", "") for a in top))) + " sources",
-        parse_mode=ParseMode.MARKDOWN,
+    # Header message
+    now_ist = datetime.now(IST)
+    date_str = now_ist.strftime("%B %d, %Y")
+    source_count = len(set(a.get("source", "") for a in top))
+    header = (
+        "\U0001f4f0 *Morning Briefing* \u2014 " + date_str + "\n"
+        + str(len(top)) + " top stories from " + str(source_count) + " sources"
     )
+    await update.message.reply_text(header, parse_mode=ParseMode.MARKDOWN)
 
-    # Send text summary with clickable links
-    text_lines = ["\U0001f517 *Article Links:*\n"]
-    for i, a in enumerate(top):
-        num = str(i + 1)
-        title = a.get("title", "")
-        source = a.get("source", "")
-        url = a.get("url", "")
-        nw = a.get("newsworthiness", 5)
-        text_lines.append(
-            num + ". [" + _escape_md(title) + "](" + url + ")\n"
-            "   " + _escape_md(source) + " | " + str(nw) + "/10"
-        )
+    # Send each story as an individual photo + caption
+    chat_id = update.effective_chat.id
+    for a in top:
+        try:
+            img_buf = render_story_card(a, scale=2)
+            caption = format_story_caption(a)
+            await context.bot.send_photo(
+                chat_id=chat_id,
+                photo=img_buf,
+                caption=caption,
+                parse_mode="Markdown",
+            )
+        except Exception as e:
+            logger.warning("Failed to send story card: %s", e)
+        await asyncio.sleep(0.3)
+
+    # Footer message
     await update.message.reply_text(
-        "\n".join(text_lines),
+        "\U0001f50e Use /topic <keyword> to dive deeper into any story",
         parse_mode=ParseMode.MARKDOWN,
-        disable_web_page_preview=True,
     )
 
     # Cleanup pil images from memory
@@ -1160,7 +1112,7 @@ async def cmd_briefing(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_breaking(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Stories with newsworthiness >= 8 from last 2 hours."""
+    """Breaking news: individual story cards for high-impact stories."""
     articles = load_news_cache()
     cutoff = datetime.now(timezone.utc) - timedelta(hours=2)
     breaking = []
@@ -1186,30 +1138,31 @@ async def cmd_breaking(update: Update, context: ContextTypes.DEFAULT_TYPE):
     breaking.sort(key=lambda x: x.get("newsworthiness", 0), reverse=True)
     top_breaking = breaking[:3]
 
+    # Header
+    await update.message.reply_text(
+        "\U0001f534 *Breaking News*",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
     # Fetch article images
     await fetch_article_images(top_breaking)
 
+    # Send each breaking story as individual photo + caption
+    chat_id = update.effective_chat.id
     for a in top_breaking:
-        img_buf = generate_breaking_card(a)
-        title = a.get("title", "")
-        source = a.get("source", "")
-        summary = a.get("ai_summary", "")
-        takeaway = a.get("ai_takeaway", "")
-        caption = (
-            "\u26a0\ufe0f *BREAKING*\n\n"
-            "*" + _escape_md(title) + "*\n"
-            + _escape_md(source) + "\n\n"
-            + _escape_md(summary) + "\n\n"
-        )
-        if takeaway:
-            caption += "\U0001f4a1 " + _escape_md(takeaway) + "\n"
-        caption += "[Full story](" + a.get("url", "") + ")"
-        await update.message.reply_photo(
-            photo=img_buf,
-            caption=caption,
-            parse_mode=ParseMode.MARKDOWN,
-        )
+        try:
+            img_buf = render_story_card(a, scale=2)
+            caption = format_story_caption(a)
+            await context.bot.send_photo(
+                chat_id=chat_id,
+                photo=img_buf,
+                caption=caption,
+                parse_mode="Markdown",
+            )
+        except Exception as e:
+            logger.warning("Failed to send breaking card: %s", e)
         a.pop("_pil_image", None)
+        await asyncio.sleep(0.3)
 
 
 async def cmd_topic(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1637,7 +1590,7 @@ async def scheduled_fetch(app):
 
 
 async def scheduled_briefing(app):
-    """Send scheduled briefings to subscribed users."""
+    """Send scheduled briefings as individual story cards."""
     try:
         articles = load_news_cache()
         if not articles:
@@ -1655,14 +1608,27 @@ async def scheduled_briefing(app):
             a["_score"] = a.get("newsworthiness", 5) - (hours_old * 0.1)
 
         articles.sort(key=lambda x: x.get("_score", 0), reverse=True)
-        top = articles[:8]
+        top = articles[:7]
 
         prefs = load_json(USER_PREFS_FILE, {})
         now_ist = datetime.now(IST)
         current_time = now_ist.strftime("%H:%M")
+        date_str = now_ist.strftime("%B %d, %Y")
 
         # Fetch article images once for all users
         await fetch_article_images(top)
+
+        # Pre-render all story cards once
+        rendered_cards = []
+        for a in top:
+            try:
+                img_buf = render_story_card(a, scale=2)
+                caption = format_story_caption(a)
+                rendered_cards.append((img_buf, caption))
+            except Exception as e:
+                logger.warning("Failed to render story card: %s", e)
+
+        source_count = len(set(a.get("source", "") for a in top))
 
         for uid, user_prefs in prefs.items():
             schedule = user_prefs.get("schedule", "07:00")
@@ -1677,30 +1643,34 @@ async def scheduled_briefing(app):
                 continue
 
             try:
-                img_buf = generate_briefing_image(top)
-                source_count = len(set(a.get("source", "") for a in top))
-                await app.bot.send_photo(
-                    chat_id=int(uid),
-                    photo=img_buf,
-                    caption="\U0001f30d *Scheduled Briefing*\n" + str(len(top)) + " stories from " + str(source_count) + " sources",
+                chat_id = int(uid)
+                # Header message
+                header = (
+                    "\U0001f4f0 *Scheduled Briefing* \u2014 " + date_str + "\n"
+                    + str(len(top)) + " top stories from " + str(source_count) + " sources"
+                )
+                await app.bot.send_message(
+                    chat_id=chat_id,
+                    text=header,
                     parse_mode=ParseMode.MARKDOWN,
                 )
-                # Also send clickable links
-                link_lines = []
-                for i, a in enumerate(top):
-                    num = str(i + 1)
-                    title = a.get("title", "")
-                    url = a.get("url", "")
-                    source = a.get("source", "")
-                    link_lines.append(
-                        num + ". [" + _escape_md(title) + "](" + url + ")\n"
-                        "   " + _escape_md(source)
+
+                # Send each story card
+                for img_buf, caption in rendered_cards:
+                    img_buf.seek(0)
+                    await app.bot.send_photo(
+                        chat_id=chat_id,
+                        photo=img_buf,
+                        caption=caption,
+                        parse_mode="Markdown",
                     )
+                    await asyncio.sleep(0.3)
+
+                # Footer
                 await app.bot.send_message(
-                    chat_id=int(uid),
-                    text="\U0001f517 *Article Links:*\n\n" + "\n".join(link_lines),
+                    chat_id=chat_id,
+                    text="\U0001f50e Use /topic <keyword> to dive deeper into any story",
                     parse_mode=ParseMode.MARKDOWN,
-                    disable_web_page_preview=True,
                 )
             except Exception as e:
                 logger.warning("Failed to send briefing to %s: %s", uid, e)
