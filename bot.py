@@ -136,6 +136,7 @@ SENT_ARTICLES_FILE = "sent_articles.json"
 CONVERSATION_FILE = "conversation_history.json"
 BOT_STATE_FILE = "bot_state.json"
 ALERTS_SENT_FILE = "alerts_sent.json"
+FOLLOW_ALERTS_FILE = "follow_alerts_sent.json"
 
 # ─── Data Helpers ────────────────────────────────────────────────────────────
 
@@ -316,6 +317,371 @@ def is_alert_sent(article_id):
     """Check if an article has already been sent as a breaking alert."""
     alerts = load_json(ALERTS_SENT_FILE, {})
     return article_id in alerts
+
+
+def mark_follow_alert_sent(user_id, article_id, keyword):
+    """Mark a follow-alert as sent for a user+article+keyword combo."""
+    alerts = load_json(FOLLOW_ALERTS_FILE, {})
+    key = str(user_id) + "_" + article_id + "_" + keyword
+    alerts[key] = datetime.now(timezone.utc).isoformat()
+    # Trim to 7 days
+    cutoff = datetime.now(timezone.utc) - timedelta(days=7)
+    trimmed = {}
+    for k, ts in alerts.items():
+        try:
+            dt = datetime.fromisoformat(ts)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            if dt > cutoff:
+                trimmed[k] = ts
+        except (ValueError, TypeError):
+            trimmed[k] = ts
+    save_json(FOLLOW_ALERTS_FILE, trimmed)
+
+
+def is_follow_alert_sent(user_id, article_id, keyword):
+    """Check if a follow-alert was already sent."""
+    alerts = load_json(FOLLOW_ALERTS_FILE, {})
+    key = str(user_id) + "_" + article_id + "_" + keyword
+    return key in alerts
+
+
+# ─── Story Clustering ───────────────────────────────────────────────────
+
+STOPWORDS = {
+    "a", "an", "the", "and", "or", "but", "in", "on", "at", "to", "for",
+    "of", "with", "by", "from", "is", "are", "was", "were", "be", "been",
+    "has", "have", "had", "do", "does", "did", "will", "would", "could",
+    "should", "may", "might", "can", "shall", "not", "no", "nor", "so",
+    "yet", "both", "each", "few", "more", "most", "other", "some", "such",
+    "than", "too", "very", "just", "about", "above", "after", "again",
+    "all", "also", "am", "as", "because", "before", "between", "during",
+    "he", "her", "here", "him", "his", "how", "i", "if", "into", "it",
+    "its", "me", "my", "new", "now", "only", "our", "out", "over", "own",
+    "s", "she", "that", "their", "them", "then", "there", "these", "they",
+    "this", "up", "us", "we", "what", "when", "which", "who", "whom",
+    "why", "you", "your", "says", "said", "say", "get", "got", "one",
+    "two", "three", "after", "being", "going", "make", "many", "much",
+}
+
+
+def extract_keywords(title):
+    """Extract significant keyword stems from a title, stripping stopwords.
+
+    Applies naive stemming (strip trailing s/ed/ing) to improve matching
+    across sources that use different word forms.
+    """
+    words = re.findall(r'[a-z]+', title.lower())
+    stems = set()
+    for w in words:
+        if w in STOPWORDS or len(w) <= 2:
+            continue
+        # Naive suffix stripping for better cross-source matching
+        stem = w
+        if stem.endswith("ing") and len(stem) > 5:
+            stem = stem[:-3]
+        elif stem.endswith("ed") and len(stem) > 4:
+            stem = stem[:-2]
+        elif stem.endswith("s") and len(stem) > 3:
+            stem = stem[:-1]
+        stems.add(stem)
+    return stems
+
+
+def _articles_match(title_a, title_b, kw_a, kw_b):
+    """Check if two articles are about the same event."""
+    sim = SequenceMatcher(None, title_a.lower(), title_b.lower()).ratio()
+    if sim > 0.5:
+        return True
+    if kw_a and kw_b:
+        overlap = len(kw_a & kw_b)
+        union = len(kw_a | kw_b)
+        kw_ratio = overlap / union if union > 0 else 0
+        if kw_ratio > 0.6:
+            return True
+        # Also match if 2+ keywords overlap (news articles about the same event
+        # typically share at least 2 significant stems like "ukraine" + "missile")
+        if overlap >= 2:
+            return True
+    return False
+
+
+def cluster_articles(articles):
+    """Group articles about the same event using title similarity + keyword overlap.
+
+    Checks candidate articles against ALL members of a cluster, not just the first.
+    Returns list of clusters:
+    {"primary": article, "related": [article, ...], "sources": ["BBC", ...]}
+    """
+    if not articles:
+        return []
+
+    assigned = [False] * len(articles)
+    clusters_idx = []  # list of lists of indices
+
+    # Precompute keywords and lowercase titles for each article
+    keywords_list = [extract_keywords(a.get("title", "")) for a in articles]
+    titles_lower = [a.get("title", "").lower() for a in articles]
+
+    for i in range(len(articles)):
+        if assigned[i]:
+            continue
+        cluster_indices = [i]
+        assigned[i] = True
+
+        for j in range(i + 1, len(articles)):
+            if assigned[j]:
+                continue
+
+            # Check against ALL articles already in this cluster
+            matched = False
+            for idx in cluster_indices:
+                if _articles_match(
+                    titles_lower[idx], titles_lower[j],
+                    keywords_list[idx], keywords_list[j],
+                ):
+                    matched = True
+                    break
+
+            if matched:
+                cluster_indices.append(j)
+                assigned[j] = True
+
+        clusters_idx.append(cluster_indices)
+
+    # Build cluster dicts
+    clusters = []
+    for indices in clusters_idx:
+        cluster_arts = [articles[idx] for idx in indices]
+        cluster_arts.sort(
+            key=lambda x: x.get("newsworthiness", 5), reverse=True
+        )
+        primary = cluster_arts[0]
+        related = cluster_arts[1:]
+        sources = list(dict.fromkeys(
+            a.get("source", "Unknown") for a in cluster_arts
+        ))
+        clusters.append({
+            "primary": primary,
+            "related": related,
+            "sources": sources,
+        })
+
+    return clusters
+
+
+async def consolidate_cluster(cluster):
+    """Call Claude Haiku to produce a consolidated summary for a multi-source cluster.
+
+    Returns dict: headline, key_points (list of 3), summary, sources (list of dicts).
+    """
+    articles = [cluster["primary"]] + cluster["related"]
+    articles_text = ""
+    for a in articles:
+        articles_text += (
+            "Source: " + a.get("source", "Unknown") + "\n"
+            "Title: " + a.get("title", "") + "\n"
+            "Summary: " + a.get("ai_summary", a.get("summary", "")) + "\n\n"
+        )
+
+    prompt_text = (
+        "You are a world-class news editor. Given these articles from different "
+        "sources about the same event, produce a consolidated summary.\n\n"
+        + articles_text
+        + "Respond in JSON with these exact keys:\n"
+        '{"headline": "...", "key_points": ["What happened: ...", '
+        '"Why it matters: ...", "What\'s next: ..."], '
+        '"summary": "2-3 sentence summary incorporating all perspectives"}'
+    )
+
+    try:
+        await rate_limited_api_call()
+        client = get_anthropic_client()
+        response = await client.messages.create(
+            model=HAIKU_MODEL,
+            max_tokens=600,
+            messages=[{"role": "user", "content": prompt_text}],
+        )
+        text = response.content[0].text.strip()
+        # Try to extract JSON — may have nested braces in key_points
+        # Find the outermost { ... }
+        start = text.find("{")
+        end = text.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            json_str = text[start:end + 1]
+            data = json.loads(json_str)
+            source_list = []
+            for a in articles:
+                source_list.append({
+                    "name": a.get("source", "Unknown"),
+                    "url": a.get("url", ""),
+                })
+            return {
+                "headline": data.get("headline", ""),
+                "key_points": data.get("key_points", [])[:3],
+                "summary": data.get("summary", ""),
+                "sources": source_list,
+            }
+    except Exception as e:
+        logger.error("Consolidation error: %s", e)
+    return None
+
+
+def format_consolidated_caption(consolidated, primary_article):
+    """Format a consolidated cluster message as a Telegram caption.
+
+    Returns (short_caption, full_text) — if short_caption is under 1024 chars
+    it can be used as a photo caption. Otherwise use short_caption for photo
+    and full_text as a follow-up text message.
+    """
+    headline = consolidated.get("headline", "")
+    key_points = consolidated.get("key_points", [])
+    summary = consolidated.get("summary", "")
+    sources = consolidated.get("sources", [])
+    num_sources = len(sources)
+
+    safe_headline = _escape_md(headline)
+    safe_summary = _escape_md(summary)
+
+    lines = [
+        "*" + safe_headline + "*",
+        "",
+        "\U0001f4ca Covered by " + str(num_sources) + " sources",
+        "",
+    ]
+    for kp in key_points:
+        lines.append("\u25b8 " + _escape_md(kp))
+    lines.append("")
+    lines.append(safe_summary)
+    lines.append("")
+    lines.append("\U0001f4f0 Sources:")
+    for s_info in sources:
+        name = _escape_md(s_info.get("name", "Unknown"))
+        url = s_info.get("url", "")
+        lines.append("\u2022 " + name + " \u2014 [Read](" + url + ")")
+
+    full_text = "\n".join(lines)
+
+    if len(full_text) <= 1024:
+        return full_text, None
+
+    # Build short caption for photo
+    short_lines = [
+        "*" + safe_headline + "*",
+        "",
+        "\U0001f4ca Covered by " + str(num_sources) + " sources",
+        "",
+        safe_summary[:200],
+    ]
+    short_caption = "\n".join(short_lines)
+    if len(short_caption) > 1024:
+        short_caption = short_caption[:1021] + "..."
+    return short_caption, full_text
+
+
+async def _send_consolidated_story(bot, chat_id, consolidated, primary_article):
+    """Send a consolidated multi-source story: photo + caption, optional follow-up."""
+    short_caption, full_text = format_consolidated_caption(
+        consolidated, primary_article
+    )
+    image_url = primary_article.get("_og_image_url")
+
+    if image_url:
+        try:
+            await bot.send_photo(
+                chat_id=chat_id,
+                photo=image_url,
+                caption=short_caption,
+                parse_mode="Markdown",
+            )
+        except Exception:
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(
+                        image_url,
+                        timeout=aiohttp.ClientTimeout(total=10),
+                        headers={"User-Agent": "Mozilla/5.0"},
+                    ) as resp:
+                        if resp.status == 200 and "image" in resp.content_type:
+                            data = await resp.read()
+                            if len(data) >= 500:
+                                await bot.send_photo(
+                                    chat_id=chat_id,
+                                    photo=data,
+                                    caption=short_caption,
+                                    parse_mode="Markdown",
+                                )
+                            else:
+                                await bot.send_message(
+                                    chat_id=chat_id,
+                                    text=short_caption,
+                                    parse_mode="Markdown",
+                                    disable_web_page_preview=True,
+                                )
+            except Exception:
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=short_caption,
+                    parse_mode="Markdown",
+                    disable_web_page_preview=True,
+                )
+    else:
+        await bot.send_message(
+            chat_id=chat_id,
+            text=short_caption,
+            parse_mode="Markdown",
+            disable_web_page_preview=True,
+        )
+
+    # Send full text as follow-up if caption was too long
+    if full_text:
+        await asyncio.sleep(0.3)
+        if len(full_text) > 4096:
+            full_text = full_text[:4093] + "..."
+        await bot.send_message(
+            chat_id=chat_id,
+            text=full_text,
+            parse_mode="Markdown",
+            disable_web_page_preview=True,
+        )
+
+
+# ─── Perspectives Analysis ──────────────────────────────────────────────
+
+async def analyze_perspectives(topic, articles):
+    """Call Claude Sonnet to analyze how different sources cover a topic."""
+    articles_text = ""
+    for a in articles:
+        articles_text += (
+            "Source: " + a.get("source", "Unknown") + "\n"
+            "Title: " + a.get("title", "") + "\n"
+            "Summary: " + a.get("ai_summary", a.get("summary", "")) + "\n\n"
+        )
+
+    prompt_text = (
+        "Analyze how these news sources cover the topic '" + topic + "'. "
+        "For each source, write 1-2 sentences about their angle, emphasis, "
+        "and what they highlight or downplay. Then provide a brief overall "
+        "assessment of the coverage spectrum.\n\n"
+        + articles_text
+        + "Format your response exactly like this:\n"
+        "SOURCE_NAME: analysis of their angle\n"
+        "---\n"
+        "OVERALL: brief assessment of the coverage spectrum with a recommendation"
+    )
+
+    try:
+        await rate_limited_api_call()
+        client = get_anthropic_client()
+        response = await client.messages.create(
+            model=SONNET_MODEL,
+            max_tokens=1200,
+            messages=[{"role": "user", "content": prompt_text}],
+        )
+        return response.content[0].text.strip()
+    except Exception as e:
+        logger.error("Perspectives analysis error: %s", e)
+        return None
 
 
 # ─── Claude API ──────────────────────────────────────────────────────────────
@@ -974,6 +1340,37 @@ async def _send_story(bot, chat_id, article):
     )
 
 
+async def _send_clustered_briefing(bot, chat_id, articles):
+    """Send articles as clustered briefing. Multi-source clusters get consolidated messages."""
+    clusters = cluster_articles(articles)
+
+    # Collect all articles for og:image fetching
+    all_arts = []
+    for c in clusters:
+        all_arts.append(c["primary"])
+        all_arts.extend(c["related"])
+    await fetch_og_image_urls(all_arts)
+
+    for c in clusters:
+        try:
+            if c["related"]:
+                # Multi-source cluster — consolidate
+                consolidated = await consolidate_cluster(c)
+                if consolidated:
+                    await _send_consolidated_story(
+                        bot, chat_id, consolidated, c["primary"]
+                    )
+                else:
+                    # Fallback: send primary as normal
+                    await _send_story(bot, chat_id, c["primary"])
+            else:
+                # Singleton — send as normal
+                await _send_story(bot, chat_id, c["primary"])
+        except Exception as e:
+            logger.warning("Failed to send cluster story: %s", e)
+        await asyncio.sleep(0.3)
+
+
 async def cmd_briefing(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Visual briefing: individual story cards sent as separate messages."""
     await update.message.reply_text("\U0001f3a8 Generating visual briefing...")
@@ -1000,9 +1397,6 @@ async def cmd_briefing(update: Update, context: ContextTypes.DEFAULT_TYPE):
     articles.sort(key=lambda x: x.get("_score", 0), reverse=True)
     top = articles[:7]
 
-    # Fetch og:image URLs for articles
-    await fetch_og_image_urls(top)
-
     # Header message
     now_ist = datetime.now(IST)
     date_str = now_ist.strftime("%B %d, %Y")
@@ -1013,14 +1407,9 @@ async def cmd_briefing(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text(header, parse_mode=ParseMode.MARKDOWN)
 
-    # Send each story as photo + caption (or text-only fallback)
+    # Send stories with clustering
     chat_id = update.effective_chat.id
-    for a in top:
-        try:
-            await _send_story(context.bot, chat_id, a)
-        except Exception as e:
-            logger.warning("Failed to send story: %s", e)
-        await asyncio.sleep(0.3)
+    await _send_clustered_briefing(context.bot, chat_id, top)
 
     # Footer message
     await update.message.reply_text(
@@ -1118,6 +1507,98 @@ async def cmd_topic(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode=ParseMode.MARKDOWN,
         disable_web_page_preview=True,
     )
+
+
+async def cmd_perspectives(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Multi-source viewpoint comparison for a topic."""
+    if not context.args:
+        await update.message.reply_text("Usage: /perspectives <topic>\nExample: /perspectives Ukraine war")
+        return
+
+    query = " ".join(context.args).lower()
+    await update.message.reply_text("\U0001f50d Analyzing perspectives on: " + _escape_md(query) + "...", parse_mode=ParseMode.MARKDOWN)
+
+    articles = load_news_cache()
+    # Find matching articles
+    matches = []
+    for a in articles:
+        searchable = (
+            a.get("title", "").lower() + " " +
+            a.get("ai_summary", "").lower() + " " +
+            a.get("summary", "").lower() + " " +
+            a.get("category", "").lower()
+        )
+        if query in searchable:
+            matches.append(a)
+
+    # Group by source, pick best from each
+    by_source = {}
+    for a in matches:
+        src = a.get("source", "Unknown")
+        if src not in by_source:
+            by_source[src] = a
+        else:
+            # Keep higher newsworthiness
+            if a.get("newsworthiness", 0) > by_source[src].get("newsworthiness", 0):
+                by_source[src] = a
+
+    if len(by_source) < 2:
+        await update.message.reply_text(
+            "Not enough sources covering this topic for comparison.\n"
+            "Need at least 2 different sources. Try a broader topic."
+        )
+        return
+
+    # Take up to 5 sources
+    source_articles = list(by_source.values())[:5]
+
+    # Call Claude to analyze perspectives
+    analysis = await analyze_perspectives(query, source_articles)
+    if not analysis:
+        await update.message.reply_text("Unable to generate perspective analysis right now. Try again later.")
+        return
+
+    # Parse and format the analysis
+    display_query = " ".join(context.args)
+    source_count = str(len(source_articles))
+    lines = [
+        "\U0001f50d *Perspectives: " + _escape_md(display_query) + "*",
+        "",
+        "Analyzing coverage from " + source_count + " sources...",
+        "",
+    ]
+
+    # Parse structured response
+    parts = analysis.split("---")
+    source_analysis = parts[0].strip() if parts else analysis
+    overall = parts[1].strip() if len(parts) > 1 else ""
+
+    # Format source analyses
+    for source_line in source_analysis.split("\n"):
+        source_line = source_line.strip()
+        if not source_line:
+            continue
+        if ":" in source_line:
+            src_name, src_text = source_line.split(":", 1)
+            lines.append(
+                "\U0001f4f0 *" + _escape_md(src_name.strip()) + "*"
+            )
+            lines.append(_escape_md(src_text.strip()))
+            lines.append("")
+        else:
+            lines.append(_escape_md(source_line))
+
+    if overall:
+        # Strip "OVERALL:" prefix if present
+        overall_text = overall
+        if overall_text.upper().startswith("OVERALL:"):
+            overall_text = overall_text[8:]
+        lines.append("\u2696\ufe0f *Overall*: " + _escape_md(overall_text.strip()))
+
+    text = "\n".join(lines)
+    if len(text) > 4000:
+        text = text[:4000] + "..."
+    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
 
 
 async def cmd_deep(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1445,6 +1926,87 @@ async def cmd_set(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Unknown setting: " + param)
 
 
+async def cmd_follow(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Subscribe to keyword alerts."""
+    if not context.args:
+        await update.message.reply_text("Usage: /follow <keyword>\nExample: /follow Ukraine")
+        return
+
+    keyword = " ".join(context.args).strip()
+    if not keyword:
+        await update.message.reply_text("Please provide a keyword to follow.")
+        return
+
+    user_id = update.effective_user.id
+    prefs = get_user_prefs(user_id)
+    follows = prefs.get("follows", [])
+
+    # Check if already following (case-insensitive)
+    for f in follows:
+        if f.lower() == keyword.lower():
+            await update.message.reply_text("You're already following '" + keyword + "'.")
+            return
+
+    follows.append(keyword)
+    set_user_prefs(user_id, "follows", follows)
+    await update.message.reply_text(
+        "\u2705 Now following '" + keyword + "'.\n"
+        "You'll get alerts for matching stories."
+    )
+
+
+async def cmd_unfollow(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Unsubscribe from keyword alerts."""
+    if not context.args:
+        await update.message.reply_text("Usage: /unfollow <keyword>\nExample: /unfollow Ukraine")
+        return
+
+    keyword = " ".join(context.args).strip()
+    user_id = update.effective_user.id
+    prefs = get_user_prefs(user_id)
+    follows = prefs.get("follows", [])
+
+    # Case-insensitive removal
+    new_follows = [f for f in follows if f.lower() != keyword.lower()]
+    if len(new_follows) == len(follows):
+        await update.message.reply_text("You weren't following '" + keyword + "'.")
+        return
+
+    set_user_prefs(user_id, "follows", new_follows)
+    await update.message.reply_text("Unfollowed '" + keyword + "'.")
+
+
+async def cmd_following(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """List current keyword follows."""
+    user_id = update.effective_user.id
+    prefs = get_user_prefs(user_id)
+    follows = prefs.get("follows", [])
+
+    if not follows:
+        await update.message.reply_text(
+            "You're not following any topics.\n"
+            "Use /follow <keyword> to start."
+        )
+        return
+
+    follows_str = ", ".join(follows)
+    await update.message.reply_text("You're following: " + follows_str)
+
+
+def _matches_follow_keyword(keyword, article):
+    """Check if a keyword matches an article's title or summary.
+
+    For multi-word keywords, all words must appear (not necessarily adjacent).
+    """
+    text = (
+        article.get("title", "").lower() + " " +
+        article.get("ai_summary", "").lower() + " " +
+        article.get("summary", "").lower()
+    )
+    words = keyword.lower().split()
+    return all(w in text for w in words)
+
+
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Command list (64-char width for mobile)."""
     help_text = (
@@ -1452,8 +2014,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
         "/news     \u2014 Top 5 stories with AI\n"
         "            summaries\n"
-        "/briefing \u2014 Visual news report\n"
-        "            (infographic image)\n"
+        "/briefing \u2014 Clustered news report\n"
+        "            (groups related stories)\n"
         "/breaking \u2014 High-impact stories\n"
         "            (newsworthiness 8+)\n"
         "/topic    \u2014 Search by keyword\n"
@@ -1462,6 +2024,15 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "            story from /news\n"
         "/ask      \u2014 Ask about the news\n"
         "            (AI-powered Q&A)\n"
+        "\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
+        "/perspectives \u2014 Compare how sources\n"
+        "    cover the same topic differently\n"
+        "    Usage: /perspectives AI regulation\n"
+        "\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
+        "/follow   \u2014 Get alerts for a keyword\n"
+        "            Usage: /follow Ukraine\n"
+        "/unfollow \u2014 Stop keyword alerts\n"
+        "/following \u2014 List followed keywords\n"
         "\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
         "/categories \u2014 Set preferred topics\n"
         "/schedule   \u2014 Daily briefing time\n"
@@ -1505,7 +2076,7 @@ def _format_prefs(prefs):
 # ─── Scheduled Tasks ────────────────────────────────────────────────────────
 
 async def scheduled_fetch(app):
-    """Periodic news fetch + auto-send breaking alerts."""
+    """Periodic news fetch + auto-send breaking alerts + follow keyword alerts."""
     try:
         count = await fetch_all_news()
         logger.info("Scheduled fetch completed: %d new articles", count)
@@ -1538,6 +2109,58 @@ async def scheduled_fetch(app):
                         await asyncio.sleep(0.3)
                 except Exception as e:
                     logger.warning("Alert failed for user %s: %s", uid, e)
+
+        # Follow keyword alerts
+        prefs = load_json(USER_PREFS_FILE, {})
+        # Collect all follow-alert articles to fetch og:images for
+        follow_alert_articles = []
+        user_alerts = {}  # uid -> list of (article, keyword)
+
+        for uid, user_prefs in prefs.items():
+            follows = user_prefs.get("follows", [])
+            if not follows:
+                continue
+            matched = []
+            for a in articles:
+                aid = a.get("id", "")
+                if not aid:
+                    continue
+                for kw in follows:
+                    if is_follow_alert_sent(uid, aid, kw):
+                        continue
+                    if _matches_follow_keyword(kw, a):
+                        matched.append((a, kw))
+                        if len(matched) >= 3:
+                            break
+                if len(matched) >= 3:
+                    break
+            if matched:
+                user_alerts[uid] = matched
+                for a, _kw in matched:
+                    follow_alert_articles.append(a)
+
+        if follow_alert_articles:
+            await fetch_og_image_urls(follow_alert_articles)
+
+        for uid, matched in user_alerts.items():
+            try:
+                chat_id = int(uid)
+                for a, kw in matched:
+                    try:
+                        # Send with a follow-alert header
+                        header = "\U0001f514 *Keyword Alert:* " + _escape_md(kw)
+                        await app.bot.send_message(
+                            chat_id=chat_id,
+                            text=header,
+                            parse_mode=ParseMode.MARKDOWN,
+                        )
+                        await _send_story(app.bot, chat_id, a)
+                        mark_follow_alert_sent(uid, a.get("id", ""), kw)
+                    except Exception as e:
+                        logger.warning("Follow alert failed for %s: %s", uid, e)
+                    await asyncio.sleep(0.3)
+            except Exception as e:
+                logger.warning("Follow alert failed for user %s: %s", uid, e)
     except Exception as e:
         logger.error("Scheduled fetch error: %s", e)
 
@@ -1598,13 +2221,8 @@ async def scheduled_briefing(app):
                     parse_mode=ParseMode.MARKDOWN,
                 )
 
-                # Send each story
-                for a in top:
-                    try:
-                        await _send_story(app.bot, chat_id, a)
-                    except Exception as e:
-                        logger.warning("Failed to send story to %s: %s", uid, e)
-                    await asyncio.sleep(0.3)
+                # Send stories with clustering
+                await _send_clustered_briefing(app.bot, chat_id, top)
 
                 # Footer
                 await app.bot.send_message(
@@ -1657,11 +2275,15 @@ async def post_init(application):
     commands = [
         BotCommand("start", "Welcome + setup"),
         BotCommand("news", "Top 5 stories"),
-        BotCommand("briefing", "Visual news report"),
+        BotCommand("briefing", "Clustered news report"),
         BotCommand("breaking", "High-impact stories"),
         BotCommand("topic", "Search by keyword"),
+        BotCommand("perspectives", "Multi-source viewpoint comparison"),
         BotCommand("deep", "Deep analysis"),
         BotCommand("ask", "Ask about the news"),
+        BotCommand("follow", "Follow a keyword for alerts"),
+        BotCommand("unfollow", "Stop following a keyword"),
+        BotCommand("following", "List followed keywords"),
         BotCommand("categories", "Set topics"),
         BotCommand("schedule", "Daily briefing time"),
         BotCommand("sources", "News sources"),
@@ -1725,8 +2347,12 @@ def main():
     application.add_handler(CommandHandler("briefing", cmd_briefing))
     application.add_handler(CommandHandler("breaking", cmd_breaking))
     application.add_handler(CommandHandler("topic", cmd_topic))
+    application.add_handler(CommandHandler("perspectives", cmd_perspectives))
     application.add_handler(CommandHandler("deep", cmd_deep))
     application.add_handler(CommandHandler("ask", cmd_ask))
+    application.add_handler(CommandHandler("follow", cmd_follow))
+    application.add_handler(CommandHandler("unfollow", cmd_unfollow))
+    application.add_handler(CommandHandler("following", cmd_following))
     application.add_handler(CommandHandler("categories", cmd_categories))
     application.add_handler(CommandHandler("schedule", cmd_schedule))
     application.add_handler(CommandHandler("sources", cmd_sources))
