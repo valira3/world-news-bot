@@ -362,6 +362,13 @@ STOPWORDS = {
     "this", "up", "us", "we", "what", "when", "which", "who", "whom",
     "why", "you", "your", "says", "said", "say", "get", "got", "one",
     "two", "three", "after", "being", "going", "make", "many", "much",
+    # Common news words that cause false-positive keyword matches
+    "news", "report", "update", "latest", "breaking", "official", "officials",
+    "government", "state", "country", "world", "global", "international",
+    "national", "local", "today", "year", "years", "people", "back", "first",
+    "time", "with", "from", "were", "have", "has", "had", "will", "would",
+    "could", "also", "just", "more", "most", "some", "other", "into", "about",
+    "than", "been", "not", "but", "can", "all",
 }
 
 
@@ -397,11 +404,13 @@ def _articles_match(title_a, title_b, kw_a, kw_b):
         overlap = len(kw_a & kw_b)
         union = len(kw_a | kw_b)
         kw_ratio = overlap / union if union > 0 else 0
-        if kw_ratio > 0.6:
+        if kw_ratio > 0.5:
             return True
-        # Also match if 2+ keywords overlap (news articles about the same event
-        # typically share at least 2 significant stems like "ukraine" + "missile")
-        if overlap >= 2:
+        # Combined: moderate title similarity + some keyword overlap
+        if sim > 0.35 and overlap >= 2:
+            return True
+        # Strong keyword overlap (3+ shared stems is a reliable signal)
+        if overlap >= 3:
             return True
     return False
 
@@ -935,12 +944,41 @@ async def fetch_all_news():
     existing_ids = {a.get("id") for a in existing}
     existing_titles = [a.get("title", "") for a in existing]
 
+    # Build a set of recent articles (last 6h) for semantic dedup
+    now_utc = datetime.now(timezone.utc)
+    recent_articles = []
+    for a in existing:
+        try:
+            fetched = datetime.fromisoformat(a.get("fetched_at", "2000-01-01").replace("Z", "+00:00"))
+            if fetched.tzinfo is None:
+                fetched = fetched.replace(tzinfo=timezone.utc)
+            if (now_utc - fetched).total_seconds() <= 21600:  # 6 hours
+                recent_articles.append(a)
+        except (ValueError, TypeError):
+            pass
+
     new_articles = []
     for raw in all_raw:
         aid = hash_url(raw["url"])
         if aid in existing_ids:
             continue
         if is_duplicate_title(raw["title"], existing_titles):
+            continue
+        # Level 2: keyword+similarity match against recent cached articles (last 6h)
+        raw_kw = extract_keywords(raw["title"])
+        is_dup = False
+        for recent in recent_articles:
+            if _articles_match(raw["title"], recent.get("title", ""), raw_kw, extract_keywords(recent.get("title", ""))):
+                is_dup = True
+                break
+        if is_dup:
+            continue
+        # Level 2b: check against other new articles collected so far in this batch
+        for already in new_articles:
+            if _articles_match(raw["title"], already.get("title", ""), raw_kw, extract_keywords(already.get("title", ""))):
+                is_dup = True
+                break
+        if is_dup:
             continue
         existing_ids.add(aid)
         existing_titles.append(raw["title"])
@@ -2093,15 +2131,18 @@ async def scheduled_fetch(app):
                 break
 
         if new_breaking:
-            logger.info("Auto-alerting %d breaking stories", len(new_breaking))
-            await fetch_og_image_urls(new_breaking)
+            # Cluster breaking alerts to avoid sending near-duplicate stories
+            breaking_clusters = cluster_articles(new_breaking)
+            deduped_breaking = [c["primary"] for c in breaking_clusters]
+            logger.info("Auto-alerting %d breaking stories (%d after dedup)", len(new_breaking), len(deduped_breaking))
+            await fetch_og_image_urls(deduped_breaking)
             prefs = load_json(USER_PREFS_FILE, {})
             for uid, user_prefs in prefs.items():
                 if not user_prefs.get("alerts", True):
                     continue
                 try:
                     chat_id = int(uid)
-                    for a in new_breaking:
+                    for a in deduped_breaking:
                         try:
                             await _send_story(app.bot, chat_id, a)
                         except Exception as e:
@@ -2135,8 +2176,13 @@ async def scheduled_fetch(app):
                 if len(matched) >= 3:
                     break
             if matched:
-                user_alerts[uid] = matched
-                for a, _kw in matched:
+                # Cluster matched articles to avoid sending near-duplicate stories
+                matched_articles_only = [a for a, _kw in matched]
+                follow_clusters = cluster_articles(matched_articles_only)
+                primary_ids = {c["primary"].get("id") for c in follow_clusters}
+                deduped_matched = [(a, kw) for a, kw in matched if a.get("id") in primary_ids]
+                user_alerts[uid] = deduped_matched
+                for a, _kw in deduped_matched:
                     follow_alert_articles.append(a)
 
         if follow_alert_articles:
