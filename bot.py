@@ -415,6 +415,137 @@ def _articles_match(title_a, title_b, kw_a, kw_b):
     return False
 
 
+async def ai_dedup_articles(new_articles, recent_cache):
+    """Use Claude Haiku to identify which new articles are duplicates of cached ones.
+
+    Returns list of new articles that are NOT duplicates.
+    """
+    if not new_articles or not recent_cache:
+        return new_articles
+
+    # Build a numbered reference list of recent cache titles+sources
+    cache_ref = []
+    for i, a in enumerate(recent_cache[:50]):  # Cap at 50 recent
+        cache_ref.append(str(i + 1) + ". [" + a.get("source", "") + "] " + a.get("title", ""))
+    cache_text = "\n".join(cache_ref)
+
+    # Check new articles in batches of 10
+    unique_articles = []
+    for batch_start in range(0, len(new_articles), 10):
+        batch = new_articles[batch_start:batch_start + 10]
+        new_ref = []
+        for i, a in enumerate(batch):
+            letter = chr(65 + i)
+            new_ref.append(letter + ". [" + a.get("source", "") + "] " + a.get("title", ""))
+        new_text = "\n".join(new_ref)
+
+        prompt = (
+            "You are a news deduplication system. Compare these NEW articles against the EXISTING articles.\n"
+            "Two articles are DUPLICATES if they cover the SAME specific event or development, even if worded differently.\n"
+            "Two articles are NOT duplicates if they cover different aspects/events within the same broad topic.\n\n"
+            "EXISTING articles:\n" + cache_text + "\n\n"
+            "NEW articles:\n" + new_text + "\n\n"
+            "For each new article (A, B, C...), respond with ONLY:\n"
+            "- 'X: UNIQUE' if it covers a new event not in the existing list\n"
+            "- 'X: DUP of Y' if it duplicates existing article number Y\n"
+            "One line per article, nothing else."
+        )
+
+        try:
+            await rate_limited_api_call()
+            client = get_anthropic_client()
+            response = await client.messages.create(
+                model=HAIKU_MODEL,
+                max_tokens=500,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            result_text = response.content[0].text.strip()
+
+            # Parse response
+            for i, a in enumerate(batch):
+                letter = chr(65 + i)
+                # Check if this article was marked as UNIQUE
+                found = False
+                for line in result_text.split("\n"):
+                    line = line.strip()
+                    if line.startswith(letter + ":") or line.startswith(letter + " :"):
+                        found = True
+                        if "UNIQUE" in line.upper():
+                            unique_articles.append(a)
+                        else:
+                            logger.info("AI dedup: removed '%s' as duplicate", a.get("title", "")[:60])
+                        break
+                if not found:
+                    # If not mentioned in response, assume unique (safe default)
+                    unique_articles.append(a)
+        except Exception as e:
+            logger.warning("AI dedup failed: %s — keeping all articles", e)
+            unique_articles.extend(batch)
+
+    logger.info("AI dedup against cache: %d -> %d articles", len(new_articles), len(unique_articles))
+    return unique_articles
+
+
+async def ai_dedup_within_batch(articles):
+    """Use Claude Haiku to deduplicate articles within the same batch.
+
+    When multiple feeds report the same event, keeps only the best version.
+    Returns deduplicated list.
+    """
+    if len(articles) <= 1:
+        return articles
+
+    # Build numbered list
+    art_ref = []
+    for i, a in enumerate(articles):
+        art_ref.append(str(i + 1) + ". [" + a.get("source", "") + "] " + a.get("title", ""))
+    art_text = "\n".join(art_ref)
+
+    prompt = (
+        "You are a news deduplication system. These articles were all fetched at the same time.\n"
+        "Identify groups of articles that cover the SAME specific event or development.\n"
+        "Two articles are DUPLICATES if they report on the same event, even if worded differently.\n\n"
+        "Articles:\n" + art_text + "\n\n"
+        "For each article, respond with ONLY:\n"
+        "- 'N: UNIQUE' if it is not a duplicate of any other article in this list\n"
+        "- 'N: DUP of M' if it duplicates article M (keep the one with the more detailed title)\n"
+        "One line per article, nothing else."
+    )
+
+    try:
+        await rate_limited_api_call()
+        client = get_anthropic_client()
+        response = await client.messages.create(
+            model=HAIKU_MODEL,
+            max_tokens=500,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        result_text = response.content[0].text.strip()
+
+        # Parse: keep articles marked UNIQUE or not mentioned
+        unique_articles = []
+        for i, a in enumerate(articles):
+            num = str(i + 1)
+            found = False
+            for line in result_text.split("\n"):
+                line = line.strip()
+                if line.startswith(num + ":") or line.startswith(num + " :"):
+                    found = True
+                    if "UNIQUE" in line.upper():
+                        unique_articles.append(a)
+                    else:
+                        logger.info("AI batch dedup: removed '%s' as duplicate", a.get("title", "")[:60])
+                    break
+            if not found:
+                unique_articles.append(a)
+
+        logger.info("AI batch dedup: %d -> %d articles", len(articles), len(unique_articles))
+        return unique_articles
+    except Exception as e:
+        logger.warning("AI batch dedup failed: %s — keeping all articles", e)
+        return articles
+
+
 def cluster_articles(articles):
     """Group articles about the same event using title similarity + keyword overlap.
 
@@ -944,7 +1075,7 @@ async def fetch_all_news():
     existing_ids = {a.get("id") for a in existing}
     existing_titles = [a.get("title", "") for a in existing]
 
-    # Build a set of recent articles (last 6h) for semantic dedup
+    # Build a set of recent articles (last 24h) for semantic dedup
     now_utc = datetime.now(timezone.utc)
     recent_articles = []
     for a in existing:
@@ -952,7 +1083,7 @@ async def fetch_all_news():
             fetched = datetime.fromisoformat(a.get("fetched_at", "2000-01-01").replace("Z", "+00:00"))
             if fetched.tzinfo is None:
                 fetched = fetched.replace(tzinfo=timezone.utc)
-            if (now_utc - fetched).total_seconds() <= 21600:  # 6 hours
+            if (now_utc - fetched).total_seconds() <= 86400:  # 24 hours
                 recent_articles.append(a)
         except (ValueError, TypeError):
             pass
@@ -984,7 +1115,17 @@ async def fetch_all_news():
         existing_titles.append(raw["title"])
         new_articles.append(raw)
 
-    logger.info("New unique articles: %d", len(new_articles))
+    logger.info("New unique articles after string dedup: %d", len(new_articles))
+
+    # AI-powered dedup: check new articles against recent cache
+    if new_articles and recent_articles:
+        new_articles = await ai_dedup_articles(new_articles, recent_articles)
+
+    # AI-powered dedup: check new articles against each other within this batch
+    if len(new_articles) > 1:
+        new_articles = await ai_dedup_within_batch(new_articles)
+
+    logger.info("New unique articles after AI dedup: %d", len(new_articles))
 
     # Summarize with AI (batch, with rate limiting)
     summarized = 0
@@ -1301,13 +1442,18 @@ async def cmd_news(update: Update, context: ContextTypes.DEFAULT_TYPE):
         a["_score"] = a.get("newsworthiness", 5) - (hours_old * 0.1)
 
     articles.sort(key=lambda x: x.get("_score", 0), reverse=True)
-    top = articles[:5]
+    top = articles[:15]  # Take more, then cluster down
 
-    # Store in context for /deep reference
-    context.user_data["last_news"] = top
+    # Cluster to remove duplicates in display
+    clusters = cluster_articles(top)
+    display_clusters = clusters[:5]
+
+    # Store primary articles in context for /deep reference
+    context.user_data["last_news"] = [c["primary"] for c in display_clusters]
 
     lines = ["\U0001f4f0 *Top News Stories*\n"]
-    for i, a in enumerate(top):
+    for i, c in enumerate(display_clusters):
+        a = c["primary"]
         num = str(i + 1)
         emoji = CATEGORY_EMOJI.get(a.get("category", "general"), "\U0001f4f0")
         title = a.get("title", "Untitled")
@@ -1316,8 +1462,13 @@ async def cmd_news(update: Update, context: ContextTypes.DEFAULT_TYPE):
         takeaway = a.get("ai_takeaway", "")
         nw = a.get("newsworthiness", 5)
 
+        extra_count = len(c["related"])
+        source_suffix = ""
+        if extra_count > 0:
+            source_suffix = " (+" + str(extra_count) + " more sources)"
+
         text = emoji + " *" + num + ". " + _escape_md(title) + "*\n"
-        text += "\U0001f4cd " + _escape_md(source) + " | "
+        text += "\U0001f4cd " + _escape_md(source) + source_suffix + " | "
         text += "\u2b50 " + str(nw) + "/10\n"
         if summary:
             text += _escape_md(summary[:200]) + "\n"
@@ -1526,17 +1677,26 @@ async def cmd_topic(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     matches.sort(key=lambda x: x.get("newsworthiness", 0), reverse=True)
-    top = matches[:5]
+    top = matches[:15]  # Take more, then cluster down
+
+    # Cluster to remove duplicates in display
+    clusters = cluster_articles(top)
+    display_clusters = clusters[:5]
 
     lines = ["\U0001f50d *Results for: " + _escape_md(keyword) + "*\n"]
-    for i, a in enumerate(top):
+    for i, c in enumerate(display_clusters):
+        a = c["primary"]
         num = str(i + 1)
         emoji = CATEGORY_EMOJI.get(a.get("category", "general"), "\U0001f4f0")
         title = a.get("title", "")
         source = a.get("source", "")
+        extra_count = len(c["related"])
+        source_suffix = ""
+        if extra_count > 0:
+            source_suffix = " (+" + str(extra_count) + " more sources)"
         lines.append(
             emoji + " *" + num + ".* " + _escape_md(title) + "\n"
-            + _escape_md(source) + " | \u2b50 " + str(a.get("newsworthiness", 5)) + "/10\n"
+            + _escape_md(source) + source_suffix + " | \u2b50 " + str(a.get("newsworthiness", 5)) + "/10\n"
             + "[Read](" + a.get("url", "") + ")\n"
         )
 
@@ -2282,9 +2442,37 @@ async def scheduled_briefing(app):
         logger.error("Scheduled briefing error: %s", e)
 
 
+def cleanup_cache_duplicates():
+    """Cluster the entire cache and remove duplicates, keeping only primary articles."""
+    articles = load_news_cache()
+    if len(articles) < 2:
+        return
+
+    clusters = cluster_articles(articles)
+    # Keep only the primary (highest newsworthiness) from each cluster
+    kept = []
+    removed = 0
+    for c in clusters:
+        kept.append(c["primary"])
+        removed += len(c["related"])
+
+    if removed == 0:
+        logger.info("Cache dedup: no duplicates found in %d articles", len(articles))
+        return
+
+    # Rewrite cache with only primary articles
+    ensure_data_dir()
+    path = get_path(NEWS_CACHE_FILE)
+    with open(path, "w") as f:
+        for a in kept:
+            f.write(json.dumps(a, default=str) + "\n")
+    logger.info("Cache dedup: %d -> %d articles (%d duplicates removed)", len(articles), len(kept), removed)
+
+
 async def scheduled_cleanup():
-    """Daily cache cleanup."""
+    """Daily cache cleanup + dedup."""
     try:
+        cleanup_cache_duplicates()
         trim_news_cache(14)
         logger.info("Cache cleanup completed")
     except Exception as e:
