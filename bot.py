@@ -87,6 +87,52 @@ RSS_FEEDS = {
     "Chicago Reader": "https://chicagoreader.com/feed/",
 }
 
+# ─── Source Bias & Factuality ────────────────────────────────────────────────
+
+SOURCE_BIAS = {
+    "Reuters": {"bias": "center", "factuality": "high"},
+    "AP News": {"bias": "center", "factuality": "high"},
+    "BBC World": {"bias": "center", "factuality": "high"},
+    "The Guardian": {"bias": "lean_left", "factuality": "high"},
+    "Al Jazeera": {"bias": "center", "factuality": "mixed"},
+    "NPR": {"bias": "lean_left", "factuality": "high"},
+    "CNN": {"bias": "lean_left", "factuality": "mixed"},
+    "France24": {"bias": "center", "factuality": "high"},
+    "DW News": {"bias": "center", "factuality": "high"},
+    "ABC News": {"bias": "lean_left", "factuality": "high"},
+    "Chicago Sun-Times": {"bias": "lean_left", "factuality": "high"},
+    "Block Club Chicago": {"bias": "lean_left", "factuality": "high"},
+    "WTTW Chicago": {"bias": "center", "factuality": "high"},
+    "Chicago Reader": {"bias": "lean_left", "factuality": "high"},
+}
+
+BIAS_LABELS = {
+    "left": "\U0001f535 Left",
+    "lean_left": "\U0001f535 Lean Left",
+    "center": "\u26aa Center",
+    "lean_right": "\U0001f534 Lean Right",
+    "right": "\U0001f534 Right",
+}
+
+FACTUALITY_LABELS = {
+    "high": "\u2705 High Factuality",
+    "mixed": "\u26a0\ufe0f Mixed Factuality",
+    "low": "\u274c Low Factuality",
+}
+
+
+def get_bias_label(source_name):
+    """Return formatted bias + factuality string for a source, or empty string."""
+    info = SOURCE_BIAS.get(source_name)
+    if not info:
+        return ""
+    bias = BIAS_LABELS.get(info.get("bias", ""), "")
+    fact = FACTUALITY_LABELS.get(info.get("factuality", ""), "")
+    if bias and fact:
+        return bias + " \u00b7 " + fact
+    return bias or fact
+
+
 # ─── Categories ──────────────────────────────────────────────────────────────
 
 CATEGORIES = {
@@ -1363,6 +1409,10 @@ def format_story_caption(article):
     safe_summary = _escape_md(summary)
     safe_source_line = _escape_md(source_line)
 
+    # Bias label
+    bias_label = get_bias_label(source)
+    safe_bias = _escape_md(bias_label) if bias_label else ""
+
     # Assemble caption — headline first so it shows in push notifications
     parts = [
         "*" + safe_title + "*",
@@ -1372,8 +1422,10 @@ def format_story_caption(article):
         safe_summary,
         "",
         "\U0001f4e1 " + safe_source_line,
-        "\U0001f517 [Read full article](" + url + ")",
     ]
+    if safe_bias:
+        parts.append(safe_bias)
+    parts.append("\U0001f517 [Read full article](" + url + ")")
     caption = "\n".join(parts)
 
     # Ensure under 1024 chars (Telegram limit for photo captions)
@@ -1393,6 +1445,57 @@ def format_story_caption(article):
         caption = caption[:1021] + "..."
 
     return caption
+
+
+# ─── Article Lookup & Detail Helpers ─────────────────────────────────────────
+
+def find_article_by_id_prefix(prefix):
+    """Search news cache for an article whose ID starts with the given prefix."""
+    articles = load_news_cache()
+    for a in articles:
+        aid = a.get("id", "")
+        if aid and aid.startswith(prefix):
+            return a
+    return None
+
+
+def format_detail_message(article):
+    """Format a detailed follow-up message for the 'More' inline button."""
+    title = article.get("title", "Untitled")
+    source = article.get("source", "Unknown")
+    summary = article.get("ai_summary", article.get("summary", ""))
+    takeaway = article.get("ai_takeaway", "")
+    category = article.get("category", "general")
+    nw = article.get("newsworthiness", 5)
+    url = article.get("url", "")
+    cat_emoji = CATEGORY_EMOJI.get(category, "\U0001f4f0")
+
+    bias_label = get_bias_label(source)
+
+    lines = [
+        "\U0001f4d6 *Detailed View*",
+        "",
+        "*" + _escape_md(title) + "*",
+        "",
+    ]
+    if summary:
+        lines.append(_escape_md(summary))
+        lines.append("")
+    if takeaway:
+        lines.append("\U0001f4a1 *So What?* " + _escape_md(takeaway))
+        lines.append("")
+    lines.append(cat_emoji + " *Category:* " + _escape_md(category.capitalize()))
+    lines.append("\u2b50 *Newsworthiness:* " + str(nw) + "/10")
+    lines.append("\U0001f4e1 *Source:* " + _escape_md(source))
+    if bias_label:
+        lines.append(_escape_md(bias_label))
+    lines.append("")
+    lines.append("\U0001f517 [Read full article](" + url + ")")
+
+    text = "\n".join(lines)
+    if len(text) > 4096:
+        text = text[:4093] + "..."
+    return text
 
 
 # ─── Telegram Command Handlers ──────────────────────────────────────────────
@@ -1489,6 +1592,26 @@ async def _send_story(bot, chat_id, article):
     """Send a single story: photo with caption if og:image available, else text only."""
     caption = format_story_caption(article)
     image_url = article.get("_og_image_url")
+
+    # Build inline keyboard buttons
+    aid = article.get("id", "")
+    article_url = article.get("url", "")
+    keyboard_buttons = []
+    if aid:
+        # Truncate ID to 20 chars to stay within 64-byte callback_data limit
+        short_id = aid[:20]
+        keyboard_buttons.append(
+            InlineKeyboardButton("\U0001f4d6 More", callback_data="detail_" + short_id)
+        )
+        keyboard_buttons.append(
+            InlineKeyboardButton("\U0001f50d Perspectives", callback_data="persp_" + short_id)
+        )
+    if article_url:
+        keyboard_buttons.append(
+            InlineKeyboardButton("\U0001f4f0 Read", url=article_url)
+        )
+    reply_markup = InlineKeyboardMarkup([keyboard_buttons]) if keyboard_buttons else None
+
     if image_url:
         try:
             # Try passing URL directly — Telegram can fetch it
@@ -1497,6 +1620,7 @@ async def _send_story(bot, chat_id, article):
                 photo=image_url,
                 caption=caption,
                 parse_mode="Markdown",
+                reply_markup=reply_markup,
             )
             return
         except Exception:
@@ -1516,6 +1640,7 @@ async def _send_story(bot, chat_id, article):
                                     photo=data,
                                     caption=caption,
                                     parse_mode="Markdown",
+                                    reply_markup=reply_markup,
                                 )
                                 return
             except Exception:
@@ -1526,6 +1651,7 @@ async def _send_story(bot, chat_id, article):
         text=caption,
         parse_mode="Markdown",
         disable_web_page_preview=True,
+        reply_markup=reply_markup,
     )
 
 
@@ -1771,16 +1897,19 @@ async def cmd_perspectives(update: Update, context: ContextTypes.DEFAULT_TYPE):
     source_analysis = parts[0].strip() if parts else analysis
     overall = parts[1].strip() if len(parts) > 1 else ""
 
-    # Format source analyses
+    # Format source analyses with bias labels
     for source_line in source_analysis.split("\n"):
         source_line = source_line.strip()
         if not source_line:
             continue
         if ":" in source_line:
             src_name, src_text = source_line.split(":", 1)
+            bias_info = get_bias_label(src_name.strip())
             lines.append(
                 "\U0001f4f0 *" + _escape_md(src_name.strip()) + "*"
             )
+            if bias_info:
+                lines.append(_escape_md(bias_info))
             lines.append(_escape_md(src_text.strip()))
             lines.append("")
         else:
@@ -1953,6 +2082,123 @@ async def category_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard.append([InlineKeyboardButton("\u2705 Done", callback_data="cat_done")])
 
         await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle inline keyboard button presses for detail_ and persp_ callbacks."""
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+
+    if data.startswith("detail_"):
+        prefix = data[7:]
+        article = find_article_by_id_prefix(prefix)
+        if article:
+            detail_text = format_detail_message(article)
+            await query.message.reply_text(
+                detail_text, parse_mode="Markdown", disable_web_page_preview=True
+            )
+        else:
+            await query.message.reply_text("Article not found in cache.")
+
+    elif data.startswith("persp_"):
+        prefix = data[6:]
+        article = find_article_by_id_prefix(prefix)
+        if not article:
+            await query.message.reply_text("Article not found in cache.")
+            return
+
+        # Extract key words from title for topic search
+        title = article.get("title", "")
+        # Use the most significant words from the title as the topic
+        topic_words = [w for w in title.split() if len(w) > 3 and w.lower() not in STOPWORDS]
+        topic = " ".join(topic_words[:5]) if topic_words else title[:50]
+
+        await query.message.reply_text(
+            "\U0001f50d Analyzing perspectives on: " + _escape_md(topic) + "...",
+            parse_mode="Markdown",
+        )
+
+        # Find matching articles from different sources
+        articles = load_news_cache()
+        matches = []
+        search_lower = topic.lower()
+        for a in articles:
+            searchable = (
+                a.get("title", "").lower() + " " +
+                a.get("ai_summary", "").lower() + " " +
+                a.get("summary", "").lower()
+            )
+            # Check if any significant words match
+            topic_kw = extract_keywords(topic)
+            article_kw = extract_keywords(a.get("title", ""))
+            overlap = len(topic_kw & article_kw)
+            if overlap >= 2 or search_lower in searchable:
+                matches.append(a)
+
+        # Group by source, pick best from each
+        by_source = {}
+        for a in matches:
+            src = a.get("source", "Unknown")
+            if src not in by_source:
+                by_source[src] = a
+            elif a.get("newsworthiness", 0) > by_source[src].get("newsworthiness", 0):
+                by_source[src] = a
+
+        if len(by_source) < 2:
+            await query.message.reply_text(
+                "Not enough sources covering this topic for comparison.\n"
+                "Need at least 2 different sources. Try /perspectives with a broader topic."
+            )
+            return
+
+        source_articles = list(by_source.values())[:5]
+        analysis = await analyze_perspectives(topic, source_articles)
+        if not analysis:
+            await query.message.reply_text("Unable to generate perspective analysis right now.")
+            return
+
+        source_count = str(len(source_articles))
+        lines = [
+            "\U0001f50d *Perspectives: " + _escape_md(topic) + "*",
+            "",
+            "Analyzing coverage from " + source_count + " sources...",
+            "",
+        ]
+
+        parts = analysis.split("---")
+        source_analysis = parts[0].strip() if parts else analysis
+        overall = parts[1].strip() if len(parts) > 1 else ""
+
+        for source_line in source_analysis.split("\n"):
+            source_line = source_line.strip()
+            if not source_line:
+                continue
+            if ":" in source_line:
+                src_name, src_text = source_line.split(":", 1)
+                bias_info = get_bias_label(src_name.strip())
+                lines.append(
+                    "\U0001f4f0 *" + _escape_md(src_name.strip()) + "*"
+                )
+                if bias_info:
+                    lines.append(_escape_md(bias_info))
+                lines.append(_escape_md(src_text.strip()))
+                lines.append("")
+            else:
+                lines.append(_escape_md(source_line))
+
+        if overall:
+            overall_text = overall
+            if overall_text.upper().startswith("OVERALL:"):
+                overall_text = overall_text[8:]
+            lines.append("\u2696\ufe0f *Overall*: " + _escape_md(overall_text.strip()))
+
+        text = "\n".join(lines)
+        if len(text) > 4000:
+            text = text[:4000] + "..."
+        await query.message.reply_text(
+            text, parse_mode="Markdown", disable_web_page_preview=True
+        )
 
 
 async def cmd_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2242,9 +2488,77 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "is auto-sent every 30 min.\n"
         "Toggle: /set alerts on|off\n"
         "\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
+        "\U0001f4ac *Just type a question!*\n"
+        "No need for /ask \u2014 just type your\n"
+        "question and I'll answer using the\n"
+        "latest news context.\n"
+        "\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
+        "\U0001f4f0 Stories include inline buttons:\n"
+        "\U0001f4d6 More | \U0001f50d Perspectives | \U0001f4f0 Read\n"
+        "Bias & factuality labels shown\n"
+        "for each source.\n"
+        "\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
         "Powered by Claude AI + 14 sources"
     )
     await update.message.reply_text(help_text, parse_mode=ParseMode.MARKDOWN)
+
+
+async def handle_natural_language(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle non-command text as natural language questions about the news."""
+    text = update.message.text.strip()
+
+    # Skip very short messages (accidental sends, "ok", "thanks", etc.)
+    if len(text) < 8:
+        return
+
+    # Skip messages that look like URLs or just numbers
+    if text.startswith("http") or text.isdigit():
+        return
+
+    # Show typing indicator
+    await update.message.chat.send_action("typing")
+
+    # Get articles context (same as cmd_ask)
+    articles = load_news_cache()
+    keywords = text.lower().split()
+    scored = []
+    for a in articles:
+        searchable = (
+            a.get("title", "").lower() + " " +
+            a.get("ai_summary", "").lower() + " " +
+            a.get("summary", "").lower() + " " +
+            a.get("category", "").lower()
+        )
+        score = sum(1 for kw in keywords if len(kw) > 2 and kw in searchable)
+        if score > 0:
+            scored.append((score, a))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    relevant = [a for _, a in scored[:10]]
+
+    articles_context = ""
+    for a in relevant:
+        articles_context += "Title: " + a.get("title", "") + "\n"
+        articles_context += "Source: " + a.get("source", "") + "\n"
+        articles_context += "Published: " + a.get("published", "") + "\n"
+        articles_context += "Summary: " + a.get("ai_summary", a.get("summary", "")) + "\n"
+        articles_context += "Takeaway: " + a.get("ai_takeaway", "") + "\n\n"
+
+    if not articles_context:
+        articles_context = "No relevant articles found in the cache."
+
+    uid = str(update.effective_user.id)
+    history = get_conversation_history(uid)
+
+    answer = await ask_claude(text, articles_context, history)
+    add_conversation_exchange(uid, text, answer)
+
+    reply = "\U0001f4ac " + _escape_md(answer)
+    if relevant:
+        reply += "\n\n\U0001f4ce _Based on " + str(len(relevant)) + " articles_"
+    if len(reply) > 4000:
+        reply = reply[:4000] + "..."
+    await update.message.reply_text(reply, parse_mode=ParseMode.MARKDOWN)
 
 
 # ─── Utility Functions ───────────────────────────────────────────────────────
@@ -2594,6 +2908,10 @@ def main():
     application.add_handler(CommandHandler("set", cmd_set))
     application.add_handler(CommandHandler("help", cmd_help))
     application.add_handler(CallbackQueryHandler(category_callback, pattern=r"^cat_"))
+    application.add_handler(CallbackQueryHandler(button_callback, pattern=r"^(detail_|persp_)"))
+
+    # Natural language handler — MUST be last so it doesn't intercept commands
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_natural_language))
 
     logger.info("Starting World News Bot...")
     application.run_polling(drop_pending_updates=True)
