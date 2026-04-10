@@ -236,7 +236,7 @@ def append_news_cache(article):
         f.write(json.dumps(article, default=str) + "\n")
 
 
-def trim_news_cache(days=14):
+def trim_news_cache(days=3):
     """Remove articles older than N days from the cache."""
     cutoff = datetime.now(timezone.utc) - timedelta(days=days)
     articles = load_news_cache()
@@ -1532,20 +1532,41 @@ async def cmd_news(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("No news articles available yet. Try again shortly.")
         return
 
-    # Sort by newsworthiness and recency
+    # Filter to last 24h only, then sort by recency-weighted score
     now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(hours=24)
+    fresh = []
     for a in articles:
         try:
             pub = datetime.fromisoformat(a.get("published", "2000-01-01").replace("Z", "+00:00"))
             if pub.tzinfo is None:
                 pub = pub.replace(tzinfo=timezone.utc)
+            if pub < cutoff:
+                continue
             hours_old = (now - pub).total_seconds() / 3600
         except (ValueError, TypeError):
-            hours_old = 999
-        a["_score"] = a.get("newsworthiness", 5) - (hours_old * 0.1)
+            continue
+        a["_score"] = a.get("newsworthiness", 5) - (hours_old * 0.5)
+        fresh.append(a)
 
-    articles.sort(key=lambda x: x.get("_score", 0), reverse=True)
-    top = articles[:15]  # Take more, then cluster down
+    if not fresh:
+        # Fallback: if nothing in 24h, expand to 48h
+        cutoff48 = now - timedelta(hours=48)
+        for a in articles:
+            try:
+                pub = datetime.fromisoformat(a.get("published", "2000-01-01").replace("Z", "+00:00"))
+                if pub.tzinfo is None:
+                    pub = pub.replace(tzinfo=timezone.utc)
+                if pub < cutoff48:
+                    continue
+                hours_old = (now - pub).total_seconds() / 3600
+            except (ValueError, TypeError):
+                continue
+            a["_score"] = a.get("newsworthiness", 5) - (hours_old * 0.5)
+            fresh.append(a)
+
+    fresh.sort(key=lambda x: x.get("_score", 0), reverse=True)
+    top = fresh[:15]  # Take more, then cluster down
 
     # Cluster to remove duplicates in display
     clusters = cluster_articles(top)
@@ -1697,20 +1718,45 @@ async def cmd_briefing(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("No news available yet.")
         return
 
-    # Sort by score
+    # Filter to last 24h, sort by recency-weighted score
     now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(hours=24)
+    fresh = []
     for a in articles:
         try:
             pub = datetime.fromisoformat(a.get("published", "2000-01-01").replace("Z", "+00:00"))
             if pub.tzinfo is None:
                 pub = pub.replace(tzinfo=timezone.utc)
+            if pub < cutoff:
+                continue
             hours_old = (now - pub).total_seconds() / 3600
         except (ValueError, TypeError):
-            hours_old = 999
-        a["_score"] = a.get("newsworthiness", 5) - (hours_old * 0.1)
+            continue
+        a["_score"] = a.get("newsworthiness", 5) - (hours_old * 0.5)
+        fresh.append(a)
 
-    articles.sort(key=lambda x: x.get("_score", 0), reverse=True)
-    top = articles[:7]
+    if not fresh:
+        # Fallback to 48h if no fresh articles
+        cutoff48 = now - timedelta(hours=48)
+        for a in articles:
+            try:
+                pub = datetime.fromisoformat(a.get("published", "2000-01-01").replace("Z", "+00:00"))
+                if pub.tzinfo is None:
+                    pub = pub.replace(tzinfo=timezone.utc)
+                if pub < cutoff48:
+                    continue
+                hours_old = (now - pub).total_seconds() / 3600
+            except (ValueError, TypeError):
+                continue
+            a["_score"] = a.get("newsworthiness", 5) - (hours_old * 0.5)
+            fresh.append(a)
+
+    fresh.sort(key=lambda x: x.get("_score", 0), reverse=True)
+    top = fresh[:7]
+
+    if not top:
+        await update.message.reply_text("No recent news available. Try again later.")
+        return
 
     # Header message
     now_ist = datetime.now(IST)
@@ -2693,18 +2739,26 @@ async def scheduled_briefing(app):
             return
 
         now = datetime.now(timezone.utc)
+        cutoff = now - timedelta(hours=24)
+        fresh = []
         for a in articles:
             try:
                 pub = datetime.fromisoformat(a.get("published", "2000-01-01").replace("Z", "+00:00"))
                 if pub.tzinfo is None:
                     pub = pub.replace(tzinfo=timezone.utc)
+                if pub < cutoff:
+                    continue
                 hours_old = (now - pub).total_seconds() / 3600
             except (ValueError, TypeError):
-                hours_old = 999
-            a["_score"] = a.get("newsworthiness", 5) - (hours_old * 0.1)
+                continue
+            a["_score"] = a.get("newsworthiness", 5) - (hours_old * 0.5)
+            fresh.append(a)
 
-        articles.sort(key=lambda x: x.get("_score", 0), reverse=True)
-        top = articles[:7]
+        if not fresh:
+            return
+
+        fresh.sort(key=lambda x: x.get("_score", 0), reverse=True)
+        top = fresh[:7]
 
         prefs = load_json(USER_PREFS_FILE, {})
         now_ist = datetime.now(IST)
