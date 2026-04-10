@@ -1036,8 +1036,16 @@ async def fetch_rss_feed(session, source, url):
                             published = datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
                         except Exception:
                             pass
+                    if not published and hasattr(entry, "updated_parsed") and entry.updated_parsed:
+                        try:
+                            import calendar
+                            ts = calendar.timegm(entry.updated_parsed)
+                            published = datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+                        except Exception:
+                            pass
                     if not published:
-                        published = datetime.now(timezone.utc).isoformat()
+                        # Skip articles with no parseable date — don't fake a timestamp
+                        continue
 
                     # Extract image
                     image_url = None
@@ -1534,7 +1542,7 @@ async def cmd_news(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Filter to last 24h only, then sort by recency-weighted score
     now = datetime.now(timezone.utc)
-    cutoff = now - timedelta(hours=24)
+    cutoff = now - timedelta(hours=6)
     fresh = []
     for a in articles:
         try:
@@ -1551,7 +1559,7 @@ async def cmd_news(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not fresh:
         # Fallback: if nothing in 24h, expand to 48h
-        cutoff48 = now - timedelta(hours=48)
+        cutoff48 = now - timedelta(hours=12)
         for a in articles:
             try:
                 pub = datetime.fromisoformat(a.get("published", "2000-01-01").replace("Z", "+00:00"))
@@ -1720,7 +1728,7 @@ async def cmd_briefing(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Filter to last 24h, sort by recency-weighted score
     now = datetime.now(timezone.utc)
-    cutoff = now - timedelta(hours=24)
+    cutoff = now - timedelta(hours=6)
     fresh = []
     for a in articles:
         try:
@@ -1737,7 +1745,7 @@ async def cmd_briefing(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not fresh:
         # Fallback to 48h if no fresh articles
-        cutoff48 = now - timedelta(hours=48)
+        cutoff48 = now - timedelta(hours=12)
         for a in articles:
             try:
                 pub = datetime.fromisoformat(a.get("published", "2000-01-01").replace("Z", "+00:00"))
@@ -2739,7 +2747,7 @@ async def scheduled_briefing(app):
             return
 
         now = datetime.now(timezone.utc)
-        cutoff = now - timedelta(hours=24)
+        cutoff = now - timedelta(hours=6)
         fresh = []
         for a in articles:
             try:
