@@ -74,7 +74,7 @@ RSS_FEEDS = {
     "Al Jazeera": "https://www.aljazeera.com/xml/rss/all.xml",
     "NPR": "https://feeds.npr.org/1001/rss.xml",
     "The Guardian": "https://www.theguardian.com/world/rss",
-    "AP News": "https://feeds.apnews.com/rss/apf-topnews",
+    "AP News": "https://news.google.com/rss/search?q=site:apnews.com&hl=en-US&gl=US&ceid=US:en",
     "CNN": "http://rss.cnn.com/rss/edition_world.rss",
     "France24": "https://www.france24.com/en/rss",
     "DW News": "https://rss.dw.com/rdf/rss-en-world",
