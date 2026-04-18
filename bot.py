@@ -70,12 +70,11 @@ logger = logging.getLogger("world-news-bot")
 # ─── RSS Feeds ───────────────────────────────────────────────────────────────
 
 RSS_FEEDS = {
-    "Reuters": "https://feeds.reuters.com/reuters/topNews",
     "BBC World": "https://feeds.bbci.co.uk/news/world/rss.xml",
     "Al Jazeera": "https://www.aljazeera.com/xml/rss/all.xml",
     "NPR": "https://feeds.npr.org/1001/rss.xml",
     "The Guardian": "https://www.theguardian.com/world/rss",
-    "AP News": "https://rsshub.app/apnews/topics/apf-topnews",
+    "AP News": "https://feeds.apnews.com/rss/apf-topnews",
     "CNN": "http://rss.cnn.com/rss/edition_world.rss",
     "France24": "https://www.france24.com/en/rss",
     "DW News": "https://rss.dw.com/rdf/rss-en-world",
@@ -902,16 +901,27 @@ async def summarize_article(title, content, source):
     try:
         await rate_limited_api_call()
         client = get_anthropic_client()
+        content_text = content[:2000] if content else title
         prompt_text = (
-            "You are a world-class news analyst. Summarize this article in 2-3 concise sentences.\n"
-            "Then provide a one-line \"So What?\" takeaway explaining why this matters to a global audience.\n"
-            "Rate the newsworthiness from 1-10 (10 = most significant global event).\n"
-            "Categorize into one of: geopolitics, economy, technology, climate, conflict, science, markets.\n\n"
+            "You are a world-class news analyst. Analyze this article and respond in JSON.\n\n"
             "Article title: " + title + "\n"
-            "Article content: " + (content[:2000] if content else title) + "\n"
-            "Source: " + source + "\n\n"
-            "Respond in JSON:\n"
-            '{"summary": "...", "takeaway": "...", "newsworthiness": 8, "category": "geopolitics"}'
+            "Source: " + source + "\n"
+            "Content: " + content_text + "\n\n"
+            "Instructions:\n"
+            "1. summary: 2-3 sentences. First sentence = key fact. Include ONE concrete data point or quote if present. Note conflicting information if any.\n"
+            "2. takeaway: One punchy sentence starting with \"Why it matters:\" explaining real-world significance.\n"
+            "3. newsworthiness: Rate 1-10 using these STRICT guidelines:\n"
+            "   - 9-10: Major geopolitical crisis, war escalation, global economic shock, natural disaster 10k+ casualties\n"
+            "   - 7-8: Significant policy change, election result, major corporate news, regional conflict\n"
+            "   - 5-6: General business/political update, moderate local impact, ongoing story development\n"
+            "   - 3-4: Sports, entertainment, celebrity, lifestyle, features\n"
+            "   - 1-2: Opinion/editorial/commentary, sponsored content, trivial updates\n"
+            "   IMPORTANT: If title contains \"opinion\", \"editorial\", \"commentary\", \"analysis by\", \"op-ed\" -> max score 4\n"
+            "   IMPORTANT: If title has ALL CAPS words, \"shocking\", \"you won't believe\", \"explosive\" -> deduct 2 points (clickbait)\n"
+            "   IMPORTANT: If source is Reuters or AP News -> add 0.5 (wire service reliability bonus)\n"
+            "4. category: one of: geopolitics, economy, technology, climate, conflict, science, markets, health, local, sports, entertainment\n\n"
+            "Respond ONLY with valid JSON:\n"
+            '{"summary": "...", "takeaway": "Why it matters: ...", "newsworthiness": 7, "category": "geopolitics"}'
         )
         response = await client.messages.create(
             model=HAIKU_MODEL,
@@ -1005,6 +1015,9 @@ async def ask_claude(question, articles_context, history):
 
 # ─── News Fetching ───────────────────────────────────────────────────────────
 
+_feed_failures = {}
+
+
 async def fetch_rss_feed(session, source, url):
     """Fetch and parse a single RSS feed."""
     articles = []
@@ -1070,6 +1083,17 @@ async def fetch_rss_feed(session, source, url):
                     })
     except Exception as e:
         logger.warning("RSS fetch failed for %s: %s", source, e)
+        _feed_failures[source] = _feed_failures.get(source, 0) + 1
+        fail_count = _feed_failures[source]
+        if fail_count == 3:
+            logger.warning("Feed '%s' has failed 3 times in a row", source)
+        elif fail_count == 10:
+            logger.error("Feed '%s' has failed 10 times — consider removing it", source)
+        return articles
+
+    # On successful fetch with articles, reset failure counter
+    if articles:
+        _feed_failures[source] = 0
     return articles
 
 
@@ -1201,6 +1225,16 @@ async def fetch_all_news():
             "ai_takeaway": "",
         }
         if result:
+            # Post-processing newsworthiness caps
+            category = result.get("category", "general")
+            nw = result.get("newsworthiness", 5)
+            if category in ("sports", "entertainment"):
+                nw = min(nw, 6.0)
+            elif category == "local":
+                nw = min(nw, 7.0)
+            nw = max(1.0, min(10.0, nw))
+            result["newsworthiness"] = nw
+
             article["ai_summary"] = result["summary"]
             article["ai_takeaway"] = result["takeaway"]
             article["newsworthiness"] = result["newsworthiness"]
@@ -1421,6 +1455,10 @@ def format_story_caption(article):
     bias_label = get_bias_label(source)
     safe_bias = _escape_md(bias_label) if bias_label else ""
 
+    # Get takeaway if available
+    takeaway = article.get("ai_takeaway", "") or article.get("takeaway", "")
+    safe_takeaway = _escape_md(takeaway) if takeaway else ""
+
     # Assemble caption — headline first so it shows in push notifications
     parts = [
         "*" + safe_title + "*",
@@ -1428,9 +1466,12 @@ def format_story_caption(article):
         emoji + " " + _escape_md(cat_name),
         "",
         safe_summary,
-        "",
-        "\U0001f4e1 " + safe_source_line,
     ]
+    if safe_takeaway:
+        parts.append("")
+        parts.append("\U0001f4a1 " + safe_takeaway)
+    parts.append("")
+    parts.append("\U0001f4e1 " + safe_source_line)
     if safe_bias:
         parts.append(safe_bias)
     parts.append("\U0001f517 [Read full article](" + url + ")")
@@ -1438,14 +1479,18 @@ def format_story_caption(article):
 
     # Ensure under 1024 chars (Telegram limit for photo captions)
     if len(caption) > 1024:
-        # Calculate how much space summary can take
-        without_summary = "\n".join(parts[:4] + ["", ""] + parts[6:])
+        # Truncate summary first to make room, keep takeaway
+        skeleton_parts = list(parts)
+        # Find and clear summary to measure available space
+        summary_idx = 4
+        skeleton_parts[summary_idx] = ""
+        without_summary = "\n".join(skeleton_parts)
         max_summary = 1024 - len(without_summary) - 10
         if max_summary > 20:
             safe_summary = safe_summary[:max_summary] + "..."
         else:
             safe_summary = ""
-        parts[4] = safe_summary
+        parts[summary_idx] = safe_summary
         caption = "\n".join(parts)
 
     # Final safety truncation
@@ -1509,23 +1554,30 @@ def format_detail_message(article):
 # ─── Telegram Command Handlers ──────────────────────────────────────────────
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Welcome message + setup categories."""
+    """Interactive welcome message with onboarding buttons."""
     user = update.effective_user
     _ = get_user_prefs(user.id)
     welcome = (
-        "\U0001f30d *World News Bot*\n\n"
-        "Welcome! I aggregate news from 10+ global\n"
-        "sources, summarize with AI, and deliver\n"
-        "visual briefings.\n\n"
-        "*Quick Start:*\n"
-        "/news \u2014 Top 5 latest stories\n"
-        "/briefing \u2014 Visual news report\n"
-        "/breaking \u2014 High-impact stories\n"
-        "/ask \u2014 Ask about the news\n"
-        "/help \u2014 All commands\n\n"
-        "Set your categories with /categories"
+        "\U0001f44b *Welcome to World News Bot!*\n\n"
+        "I deliver real-time global news with AI summaries, from 13+ trusted sources.\n\n"
+        "*What I can do:*\n"
+        "\u2022 \U0001f4f0 Morning & evening briefings (auto-sent)\n"
+        "\u2022 \U0001f534 Breaking news alerts (automatic)\n"
+        "\u2022 \U0001f50d Ask me anything about today's news\n"
+        "\u2022 \U0001f30d Multi-source perspective comparison\n\n"
+        "*Try it now:*"
     )
-    await update.message.reply_text(welcome, parse_mode=ParseMode.MARKDOWN)
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("\U0001f4f0 Top Stories", callback_data="onboard_news"),
+            InlineKeyboardButton("\U0001f534 Breaking News", callback_data="onboard_breaking"),
+        ],
+        [
+            InlineKeyboardButton("\U0001f5fa My Briefing", callback_data="onboard_briefing"),
+            InlineKeyboardButton("\u2753 How to use", callback_data="onboard_help"),
+        ],
+    ])
+    await update.message.reply_text(welcome, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
 
 
 async def cmd_news(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1610,10 +1662,24 @@ async def cmd_news(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(text)
 
     lines.append("\n\U0001f50e Use /deep [1-5] for analysis")
+
+    # Store full article list for pagination
+    all_primaries = [c["primary"] for c in clusters]
+    context.user_data["news_page_articles"] = all_primaries
+    context.user_data["news_page"] = 0
+
+    # Add "Load 5 more" button if there are more stories
+    reply_markup = None
+    if len(all_primaries) > 5:
+        reply_markup = InlineKeyboardMarkup([[
+            InlineKeyboardButton("\U0001f4c4 Load 5 more \u2192", callback_data="news_page_1")
+        ]])
+
     await update.message.reply_text(
         "\n".join(lines),
         parse_mode=ParseMode.MARKDOWN,
         disable_web_page_preview=True,
+        reply_markup=reply_markup,
     )
 
 
@@ -1841,6 +1907,10 @@ async def cmd_topic(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     keyword = " ".join(context.args).lower()
     articles = load_news_cache()
+    now = datetime.now(timezone.utc)
+    cutoff_6h = now - timedelta(hours=6)
+    cutoff_12h = now - timedelta(hours=12)
+
     matches = []
     for a in articles:
         searchable = (
@@ -1856,8 +1926,47 @@ async def cmd_topic(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("No articles found for: " + keyword)
         return
 
-    matches.sort(key=lambda x: x.get("newsworthiness", 0), reverse=True)
-    top = matches[:15]  # Take more, then cluster down
+    # Apply 6h freshness filter with time decay scoring
+    fresh = []
+    for a in matches:
+        try:
+            pub = datetime.fromisoformat(a.get("published", "2000-01-01").replace("Z", "+00:00"))
+            if pub.tzinfo is None:
+                pub = pub.replace(tzinfo=timezone.utc)
+            if pub < cutoff_6h:
+                continue
+            hours_old = (now - pub).total_seconds() / 3600
+            a["_score"] = a.get("newsworthiness", 5) - (hours_old * 0.5)
+            fresh.append(a)
+        except (ValueError, TypeError):
+            continue
+
+    # Fallback to 12h if fewer than 3 results in 6h window
+    if len(fresh) < 3:
+        fresh = []
+        for a in matches:
+            try:
+                pub = datetime.fromisoformat(a.get("published", "2000-01-01").replace("Z", "+00:00"))
+                if pub.tzinfo is None:
+                    pub = pub.replace(tzinfo=timezone.utc)
+                if pub < cutoff_12h:
+                    continue
+                hours_old = (now - pub).total_seconds() / 3600
+                a["_score"] = a.get("newsworthiness", 5) - (hours_old * 0.5)
+                fresh.append(a)
+            except (ValueError, TypeError):
+                continue
+
+    if not fresh:
+        escaped_kw = _escape_md(keyword)
+        await update.message.reply_text(
+            "No recent articles found for '" + escaped_kw + "'. Stories older than 12 hours are excluded.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    fresh.sort(key=lambda x: x.get("_score", 0), reverse=True)
+    top = fresh[:15]  # Take more, then cluster down
 
     # Cluster to remove duplicates in display
     clusters = cluster_articles(top)
@@ -2139,12 +2248,12 @@ async def category_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle inline keyboard button presses for detail_ and persp_ callbacks."""
+    """Handle inline keyboard button presses for detail_, persp_, news_page_, and onboard_ callbacks."""
     query = update.callback_query
-    await query.answer()
     data = query.data
 
     if data.startswith("detail_"):
+        await query.answer("Loading details\u2026")
         prefix = data[7:]
         article = find_article_by_id_prefix(prefix)
         if article:
@@ -2156,6 +2265,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.reply_text("Article not found in cache.")
 
     elif data.startswith("persp_"):
+        await query.answer("Analyzing perspectives\u2026")
         prefix = data[6:]
         article = find_article_by_id_prefix(prefix)
         if not article:
@@ -2253,6 +2363,183 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text(
             text, parse_mode="Markdown", disable_web_page_preview=True
         )
+
+    elif data.startswith("sources_"):
+        await query.answer("Fetching sources\u2026")
+
+    elif data.startswith("news_page_"):
+        await query.answer("Loading more stories\u2026")
+        try:
+            page_num = int(data[10:])
+        except ValueError:
+            return
+        # Max 3 pages (15 total stories)
+        if page_num > 2:
+            await query.message.reply_text("That's all the stories for now. Use /news to refresh.")
+            return
+        page_articles = context.user_data.get("news_page_articles", [])
+        start = page_num * 5
+        end = start + 5
+        page_slice = page_articles[start:end]
+        if not page_slice:
+            await query.message.reply_text("No more stories available.")
+            return
+
+        lines = ["\U0001f4f0 *More Stories (page " + str(page_num + 1) + ")*\n"]
+        for i, a in enumerate(page_slice):
+            num = str(start + i + 1)
+            emoji = CATEGORY_EMOJI.get(a.get("category", "general"), "\U0001f4f0")
+            title = a.get("title", "Untitled")
+            source = a.get("source", "Unknown")
+            summary = a.get("ai_summary", a.get("summary", ""))
+            takeaway = a.get("ai_takeaway", "")
+            nw = a.get("newsworthiness", 5)
+
+            text_line = emoji + " *" + num + ". " + _escape_md(title) + "*\n"
+            text_line += "\U0001f4cd " + _escape_md(source) + " | "
+            text_line += "\u2b50 " + str(nw) + "/10\n"
+            if summary:
+                text_line += _escape_md(summary[:200]) + "\n"
+            if takeaway:
+                text_line += "\U0001f4a1 _" + _escape_md(takeaway[:150]) + "_\n"
+            text_line += "[Read more](" + a.get("url", "") + ")\n"
+            lines.append(text_line)
+
+        context.user_data["news_page"] = page_num
+
+        # Add "Load more" button if there are more and we haven't hit page 3
+        reply_markup = None
+        next_page = page_num + 1
+        if next_page <= 2 and end < len(page_articles):
+            reply_markup = InlineKeyboardMarkup([[
+                InlineKeyboardButton(
+                    "\U0001f4c4 Load 5 more \u2192",
+                    callback_data="news_page_" + str(next_page)
+                )
+            ]])
+
+        await query.message.reply_text(
+            "\n".join(lines),
+            parse_mode=ParseMode.MARKDOWN,
+            disable_web_page_preview=True,
+            reply_markup=reply_markup,
+        )
+
+    elif data.startswith("onboard_"):
+        await query.answer()
+        action = data[8:]
+        if action == "news":
+            # Trigger cmd_news logic
+            await query.message.reply_text("\U0001f50d Fetching latest news...")
+            articles = load_news_cache()
+            if not articles:
+                await fetch_all_news()
+                articles = load_news_cache()
+            if not articles:
+                await query.message.reply_text("No news articles available yet. Try again shortly.")
+                return
+            now = datetime.now(timezone.utc)
+            cutoff = now - timedelta(hours=6)
+            fresh = []
+            for a in articles:
+                try:
+                    pub = datetime.fromisoformat(a.get("published", "2000-01-01").replace("Z", "+00:00"))
+                    if pub.tzinfo is None:
+                        pub = pub.replace(tzinfo=timezone.utc)
+                    if pub < cutoff:
+                        continue
+                    hours_old = (now - pub).total_seconds() / 3600
+                except (ValueError, TypeError):
+                    continue
+                a["_score"] = a.get("newsworthiness", 5) - (hours_old * 0.5)
+                fresh.append(a)
+            if not fresh:
+                cutoff12 = now - timedelta(hours=12)
+                for a in articles:
+                    try:
+                        pub = datetime.fromisoformat(a.get("published", "2000-01-01").replace("Z", "+00:00"))
+                        if pub.tzinfo is None:
+                            pub = pub.replace(tzinfo=timezone.utc)
+                        if pub < cutoff12:
+                            continue
+                        hours_old = (now - pub).total_seconds() / 3600
+                    except (ValueError, TypeError):
+                        continue
+                    a["_score"] = a.get("newsworthiness", 5) - (hours_old * 0.5)
+                    fresh.append(a)
+            fresh.sort(key=lambda x: x.get("_score", 0), reverse=True)
+            top = fresh[:15]
+            clusters = cluster_articles(top)
+            display_clusters = clusters[:5]
+            lines = ["\U0001f4f0 *Top News Stories*\n"]
+            for i, c in enumerate(display_clusters):
+                a = c["primary"]
+                num = str(i + 1)
+                cat_emoji = CATEGORY_EMOJI.get(a.get("category", "general"), "\U0001f4f0")
+                title = a.get("title", "Untitled")
+                source = a.get("source", "Unknown")
+                summary = a.get("ai_summary", a.get("summary", ""))
+                nw = a.get("newsworthiness", 5)
+                text_line = cat_emoji + " *" + num + ". " + _escape_md(title) + "*\n"
+                text_line += "\U0001f4cd " + _escape_md(source) + " | \u2b50 " + str(nw) + "/10\n"
+                if summary:
+                    text_line += _escape_md(summary[:200]) + "\n"
+                text_line += "[Read more](" + a.get("url", "") + ")\n"
+                lines.append(text_line)
+            await query.message.reply_text(
+                "\n".join(lines),
+                parse_mode=ParseMode.MARKDOWN,
+                disable_web_page_preview=True,
+            )
+        elif action == "breaking":
+            articles = load_news_cache()
+            cutoff = datetime.now(timezone.utc) - timedelta(hours=2)
+            breaking = []
+            for a in articles:
+                if a.get("newsworthiness", 0) < 8:
+                    continue
+                try:
+                    fetched = datetime.fromisoformat(a.get("fetched_at", "2000-01-01").replace("Z", "+00:00"))
+                    if fetched.tzinfo is None:
+                        fetched = fetched.replace(tzinfo=timezone.utc)
+                    if fetched > cutoff:
+                        breaking.append(a)
+                except (ValueError, TypeError):
+                    continue
+            if not breaking:
+                await query.message.reply_text(
+                    "\u2705 No breaking news in the last 2 hours. That's a good thing!"
+                )
+            else:
+                breaking.sort(key=lambda x: x.get("newsworthiness", 0), reverse=True)
+                top_breaking = breaking[:3]
+                await fetch_og_image_urls(top_breaking)
+                chat_id = query.message.chat_id
+                for a in top_breaking:
+                    try:
+                        await _send_story(context.bot, chat_id, a)
+                    except Exception as e:
+                        logger.warning("Failed to send breaking story: %s", e)
+                    await asyncio.sleep(0.3)
+        elif action == "briefing":
+            await query.message.reply_text(
+                "Morning briefings at 7AM IST and evening at 6PM IST. Use /schedule to change timing."
+            )
+        elif action == "help":
+            await query.message.reply_text(
+                "\U0001f30d *Quick Guide*\n\n"
+                "/news \u2014 Top 5 stories with AI summaries\n"
+                "/briefing \u2014 Clustered visual news report\n"
+                "/breaking \u2014 High-impact stories (8+/10)\n"
+                "/topic <keyword> \u2014 Search by keyword\n"
+                "/ask <question> \u2014 AI-powered Q&A\n"
+                "/perspectives <topic> \u2014 Multi-source comparison\n"
+                "/follow <keyword> \u2014 Get keyword alerts\n"
+                "/help \u2014 Full command list",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+    else:
+        await query.answer()
 
 
 async def cmd_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2649,12 +2936,23 @@ async def scheduled_fetch(app):
 
         # Auto-send breaking news alerts (newsworthiness >= 8)
         articles = load_news_cache()
+        fetched_cutoff = datetime.now(timezone.utc) - timedelta(hours=4)
         new_breaking = []
         for a in articles:
             aid = a.get("id", "")
-            if aid and a.get("newsworthiness", 0) >= 8 and not is_alert_sent(aid):
-                new_breaking.append(a)
-                mark_alert_sent(aid)
+            if not aid or a.get("newsworthiness", 0) < 8 or is_alert_sent(aid):
+                continue
+            # Only alert on articles fetched within the last 4 hours
+            try:
+                fetched_at = datetime.fromisoformat(a.get("fetched_at", "2000-01-01").replace("Z", "+00:00"))
+                if fetched_at.tzinfo is None:
+                    fetched_at = fetched_at.replace(tzinfo=timezone.utc)
+                if fetched_at < fetched_cutoff:
+                    continue
+            except (ValueError, TypeError):
+                continue
+            new_breaking.append(a)
+            mark_alert_sent(aid)
             if len(new_breaking) >= 5:
                 break
 
@@ -2693,6 +2991,15 @@ async def scheduled_fetch(app):
             for a in articles:
                 aid = a.get("id", "")
                 if not aid:
+                    continue
+                # Only match articles fetched within the last 4 hours
+                try:
+                    fa = datetime.fromisoformat(a.get("fetched_at", "2000-01-01").replace("Z", "+00:00"))
+                    if fa.tzinfo is None:
+                        fa = fa.replace(tzinfo=timezone.utc)
+                    if fa < fetched_cutoff:
+                        continue
+                except (ValueError, TypeError):
                     continue
                 for kw in follows:
                     if is_follow_alert_sent(uid, aid, kw):
@@ -2970,7 +3277,7 @@ def main():
     application.add_handler(CommandHandler("set", cmd_set))
     application.add_handler(CommandHandler("help", cmd_help))
     application.add_handler(CallbackQueryHandler(category_callback, pattern=r"^cat_"))
-    application.add_handler(CallbackQueryHandler(button_callback, pattern=r"^(detail_|persp_)"))
+    application.add_handler(CallbackQueryHandler(button_callback, pattern=r"^(detail_|persp_|sources_|news_page_|onboard_)"))
 
     # Natural language handler — MUST be last so it doesn't intercept commands
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_natural_language))
